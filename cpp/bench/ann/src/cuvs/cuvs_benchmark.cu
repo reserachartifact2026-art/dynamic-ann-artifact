@@ -7,7 +7,8 @@
 #include "cuvs_ann_bench_param_parser.h"
 
 #include <rmm/mr/per_device_resource.hpp>
-
+#include <rmm/mr/device/per_device_resource.hpp>
+#include <raft/core/logger.hpp>
 #include <algorithm>
 #include <cmath>
 #include <memory>
@@ -205,5 +206,7 @@ REGISTER_ALGO_INSTANCE(std::uint8_t);
 
 #ifdef ANN_BENCH_BUILD_MAIN
 #include "../common/benchmark.hpp"
-int main(int argc, char** argv) { return cuvs::bench::run_main(argc, argv); }
+int main(int argc, char** argv) { 
+raft::default_logger().set_level( rapids_logger::level_enum::debug);
+return cuvs::bench::run_main(argc, argv); }
 #endif
