@@ -420,7 +420,26 @@ struct index : cuvs::neighbors::index {
   // Don't allow copying the index for performance reasons (try avoiding copying data)
   /** \cond */
   index(const index&)                    = delete;
-  index(index&&)                         = default;
+  //index(index&&)                         = default;
+   index(index&& other) noexcept
+  : metric_(other.metric_),
+    dataset_(std::move(other.dataset_)),
+    graph_(std::move(other.graph_)),
+    graph_view_(other.graph_view_),
+    source_indices_(std::move(other.source_indices_)),
+    dataset_fd_(std::move(other.dataset_fd_)),
+    graph_fd_(std::move(other.graph_fd_)),
+    mapping_fd_(std::move(other.mapping_fd_)),
+    dataset_norms_(std::move(other.dataset_norms_)),
+    n_rows_(other.n_rows_),
+    dim_(other.dim_),
+    graph_degree_(other.graph_degree_)
+{
+  // rebuild graph view after move
+  if (graph_.data_handle() != nullptr) {
+    graph_view_ = graph_.view();
+  }
+}
   auto operator=(const index&) -> index& = delete;
   auto operator=(index&&) -> index&      = default;
   ~index()                               = default;

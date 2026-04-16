@@ -143,6 +143,17 @@ class algo : public algo_base {
                       algo_base::index_type* neighbors,
                       float* distances) const = 0;
 
+  virtual void search_ex(const T* queries,
+                         int batch_size,
+                         int k,
+                         algo_base::index_type* neighbors,
+                         float* distances,
+                         int64_t* ids) const
+  {
+    (void)ids;
+    search(queries, batch_size, k, neighbors, distances);
+  }
+
   virtual void save(const std::string& file) const = 0;
   virtual void load(const std::string& file)       = 0;
 
@@ -158,6 +169,27 @@ class algo : public algo_base {
   // The client code should call set_search_dataset() before searching,
   // and should not release dataset before searching is finished.
   virtual void set_search_dataset(const T* /*dataset*/, size_t /*nrow*/) {};
+
+  /**
+   * Insert new vectors into the index (optional, only supported by some algorithms like CAGRA).
+   * Default implementation throws to indicate unsupported operation.
+   */
+  virtual void insert(const T* /*vectors*/, size_t /*num_vectors*/, const int64_t* /*ids*/ = nullptr)
+  {
+    throw std::runtime_error("Insert operation is not supported for this algorithm");
+  }
+
+  /**
+   * Set insert parameters from JSON configuration (optional, for algorithms that support insert).
+   * Default implementation is a no-op; algorithms supporting insert should override this.
+   */
+  virtual void set_insert_param_from_json(const nlohmann::json& /*conf*/) {}
+
+  /**
+   * Set build output file path (optional, for algorithms that support intermediate output).
+   * Default implementation is a no-op; algorithms supporting this should override.
+   */
+  virtual void set_build_output_file(const std::string& /*file*/) {}
 
   /**
    * Make a shallow copy of the algo wrapper that shares the resources and ensures thread-safe

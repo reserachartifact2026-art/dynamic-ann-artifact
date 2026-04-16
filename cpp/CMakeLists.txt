@@ -812,4 +812,15 @@ endif()
 
 if(BUILD_CUVS_BENCH)
   add_subdirectory(bench/ann/)
+
+# ------------------------------------------------------------------------
+# cuVS tools
+# ------------------------------------------------------------------------
+
+# Define an umbrella target for developer utilities
+add_custom_target(tools)
+
+# Add the tools directory (contains print_cagra_graph.cpp)
+add_subdirectory(bench/tools)
+
 endif()
