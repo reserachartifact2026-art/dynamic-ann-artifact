@@ -112,7 +112,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   void set_search_dataset(const T* dataset, size_t nrow) override;
 
   void set_insert_param(const insert_param& param);
-  void insert(const T* vectors, size_t num_vectors, const int64_t* ids = nullptr) override;
+  void insert(const T* vectors, size_t num_vectors, const uint64_t* ids = nullptr) override;
   void set_insert_param_from_json(const nlohmann::json& conf) override;
 
   void search(const T* queries,
@@ -507,7 +507,7 @@ void cuvs_cagra<T, IdxT>::set_insert_param_from_json(const nlohmann::json& conf)
 }
 
 template <typename T, typename IdxT>  
-void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const int64_t* ids)
+void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uint64_t* ids)
 {
   (void)ids;
   if (num_vectors == 0) { return; }
@@ -1186,6 +1186,25 @@ void cuvs_cagra<T, IdxT>::search_ex(
         ids[idx] = static_cast<int64_t>(neighbors[idx]);
       }
     }
+  }
+  // print first five neighbours and distances of first query for debugging
+  {
+    std::vector<algo_base::index_type> host_neighbors(std::min<std::size_t>(5, n_elems));
+    std::vector<float> host_distances(std::min<std::size_t>(5, n_elems));
+    raft::copy(host_neighbors.data(),
+               search_neighbors,
+               host_neighbors.size(),
+               stream);
+    raft::copy(host_distances.data(),
+               search_distances,
+               host_distances.size(),
+               stream);
+    raft::resource::sync_stream(res);
+    std::cout << "[search_ex] first query neighbors: ";
+    for (size_t i = 0; i < host_neighbors.size(); ++i) {
+      std::cout << host_neighbors[i] << "(" << host_distances[i] << ") ";
+    }
+    std::cout << std::endl;
   }
 }
 }  // namespace cuvs::bench

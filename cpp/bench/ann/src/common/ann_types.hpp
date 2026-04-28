@@ -174,7 +174,7 @@ class algo : public algo_base {
    * Insert new vectors into the index (optional, only supported by some algorithms like CAGRA).
    * Default implementation throws to indicate unsupported operation.
    */
-  virtual void insert(const T* /*vectors*/, size_t /*num_vectors*/, const int64_t* /*ids*/ = nullptr)
+  virtual void insert(const T* /*vectors*/, size_t /*num_vectors*/, const uint64_t* /*ids*/ = nullptr)
   {
     throw std::runtime_error("Insert operation is not supported for this algorithm");
   }
