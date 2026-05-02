@@ -200,6 +200,9 @@ class FreshBANGInner {
     search_dataset_ = std::move(ds);
   }
 
+  void set_prefer_insert_dataset_for_search(bool value) { prefer_insert_dataset_for_search_ = value; }
+  bool prefer_insert_dataset_for_search() const { return prefer_insert_dataset_for_search_; }
+
  private:
   std::string conf_path_;
   std::string data_prefix_;
@@ -210,6 +213,7 @@ class FreshBANGInner {
   int dim_{0};
   cuvs::bench::algo_property algo_property_{};
   std::shared_ptr<const cuvs::bench::dataset<T>> search_dataset_;
+  bool prefer_insert_dataset_for_search_{false};
 };
 
 }  // namespace detail
@@ -428,7 +432,8 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
   auto sp_json = index.search_params[0];
   sp_json["k"] = params.recall_at_k;
 
-  auto dataset_for_search = cuvs::bench::make_dataset<T>(conf.get_dataset_conf(), true);
+  auto dataset_for_search = cuvs::bench::make_dataset<T>(
+    conf.get_dataset_conf(), true, impl->prefer_insert_dataset_for_search());
   auto search_param = cuvs::bench::detail::create_search_param<T>(index.algo, sp_json);
   const auto algo_property =
     cuvs::bench::parse_algo_property_override(algo_obj->get_preference(), sp_json);
@@ -445,10 +450,15 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
 
   // We need to explicitly set the dataset, the previous build step wouldn't set it for us
   if (search_param->needs_dataset()) { // returns true for Cagra
-    // ToDo: Remove dependency on reading dataset portion of JSON config. Ideally we should only access
-    // the index portion
-    algo_obj->set_search_dataset(dataset_for_search->base_set(algo_property.dataset_memory_type),
-                                 dataset_for_search->base_set_size());
+    if (impl->prefer_insert_dataset_for_search() && dataset_for_search->has_insert_set()) {
+      algo_obj->set_search_dataset(dataset_for_search->insert_set(algo_property.dataset_memory_type),
+                                   dataset_for_search->insert_set_size());
+    } else {
+      // ToDo: Remove dependency on reading dataset portion of JSON config. Ideally we should only access
+      // the index portion
+      algo_obj->set_search_dataset(dataset_for_search->base_set(algo_property.dataset_memory_type),
+                                   dataset_for_search->base_set_size());
+    }
   }
 
   algo_obj->set_search_param(*search_param,
@@ -664,11 +674,27 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
     return;
   }
 
-  // Special case: if no index exists on disk, treat insert as build
+  // If an index exists on disk, load it into the fresh algo instance before insert.
   bool has_index_on_disk = cuvs::bench::detail::file_exists(impl->index_file());
-  if (!has_index_on_disk) {
-    std::cerr << "[FreshBANG::BatchedInsert] Warning: index file '" << impl->index_file()
-              << "' does not exist on disk. Treating insert as build operation." << std::endl;
+  bool use_build_path    = !has_index_on_disk;
+  if (has_index_on_disk) {
+    try {
+      std::cout << "[FreshBANG::BatchedInsert] Loading existing index from '"
+                << impl->index_file() << "' before insert" << std::endl;
+      algo_obj->load(impl->index_file());
+      std::cout << "[FreshBANG::BatchedInsert] load() completed" << std::endl;
+    } catch (const std::exception& e) {
+      std::cerr << "[FreshBANG::BatchedInsert] Warning: failed to load existing index '"
+                << impl->index_file() << "': " << e.what()
+                << ". Falling back to build operation." << std::endl;
+      use_build_path = true;
+    }
+  }
+
+  // Special case: if no index exists on disk (or load failed), treat insert as build.
+  if (use_build_path) {
+    std::cerr << "[FreshBANG::BatchedInsert] Warning: index unavailable for insert at '"
+          << impl->index_file() << "'. Treating insert as build operation." << std::endl;
     
     algo_obj->set_build_output_file(impl->index_file());
     std::cout << "[FreshBANG::BatchedInsert] Calling build() with " << batch_size << " vectors"
@@ -685,13 +711,16 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
     std::cout << "[FreshBANG::BatchedInsert] Calling save('" << impl->index_file() << "')" << std::endl;
     algo_obj->save(impl->index_file());
     std::cout << "[FreshBANG::BatchedInsert] save() completed" << std::endl;
+    impl->set_prefer_insert_dataset_for_search(true);
     // ToDo: check if we can assign hostside insertvectors like this directly.
-        algo_obj->set_search_dataset(insertvectors,
+/*        algo_obj->set_search_dataset(insertvectors,
                                  batch_size);
-                                 return;
+  */                             
   }
-
+  else {
+  impl->set_prefer_insert_dataset_for_search(false);
   algo_obj->insert(insertvectors, batch_size, ids);
+  }
 
   std::cout << "[INSERT] Insert completed successfully" << std::endl;
 
@@ -702,6 +731,46 @@ void FreshBANG<T>::BatchedDelete(const uint64_t* ids, uint32_t batch_size)
 {
   std::cout << "[FreshBANG::BatchedDelete] batch_size=" << batch_size
             << " ids=" << static_cast<const void*>(ids) << std::endl;
+
+  if (m_pImpl == nullptr) {
+    std::cerr << "[FreshBANG::BatchedDelete] Error: CreateAlgo() must be called before "
+                 "BatchedDelete()."
+              << std::endl;
+    return;
+  }
+
+  if (batch_size == 0) {
+    std::cout << "[FreshBANG::BatchedDelete] batch_size is 0; skipping delete" << std::endl;
+    return;
+  }
+
+  if (ids == nullptr) {
+    std::cerr << "[FreshBANG::BatchedDelete] Error: ids must be non-null when batch_size > 0."
+              << std::endl;
+    return;
+  }
+
+  auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
+                                                            impl->algo_name(),
+                                                            cuvs::bench::get_dtype_string<T>(),
+                                                            impl->dim(),
+                                                            std::chrono::minutes(60));
+  if (!cached.has_value()) {
+    std::cerr << "[FreshBANG::BatchedDelete] Error: algo cache miss for index file "
+              << impl->index_file() << ". Call CreateAlgo() again." << std::endl;
+    return;
+  }
+
+  auto* algo_obj = static_cast<cuvs::bench::algo<T>*>(cached->algo_ptr);
+  if (algo_obj == nullptr) {
+    std::cerr << "[FreshBANG::BatchedDelete] Error: cached algo pointer is null." << std::endl;
+    return;
+  }
+
+  algo_obj->delete_vectors(ids, static_cast<size_t>(batch_size));
+  algo_obj->save(impl->index_file());
+  std::cout << "[FreshBANG::BatchedDelete] delete() completed" << std::endl;
 }
 
 template <typename T>

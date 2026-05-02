@@ -56,6 +56,8 @@ public:
     // Note: Only ONE batched operation can be performed at a time. 
     // Concurrent operations (e.g., search and insert at the same time) are not supported in this version.
 
+    // Note on IDs: These are actually slots IDs. Always in range 0 - N-1 and re-used across deletes and inserts. 
+    
     void BatchedSearch(const T* searchvectors, 
                         uint32_t batch_size,
                         uint64_t* ids,

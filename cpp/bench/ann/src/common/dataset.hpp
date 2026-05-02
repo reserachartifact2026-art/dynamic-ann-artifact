@@ -44,6 +44,7 @@ struct dataset {
   std::string distance_;
   blob<DataT> base_set_;
   blob<DataT> query_set_;
+  std::optional<blob<DataT>> insert_set_;
   std::optional<blob<IdxT>> ground_truth_set_;
   std::optional<blob<bitset_carrier_type>> filter_bitset_;
 
@@ -70,10 +71,33 @@ struct dataset {
           std::string distance,
           std::optional<std::string> groundtruth_neighbors_file,
           std::optional<double> filtering_rate = std::nullopt)
+    : dataset(std::move(name),
+              std::move(base_file),
+              subset_first_row,
+              subset_size,
+              std::move(query_file),
+              std::move(distance),
+              std::move(groundtruth_neighbors_file),
+              std::nullopt,
+              filtering_rate)
+  {
+  }
+
+  dataset(std::string name,
+          std::string base_file,
+          uint32_t subset_first_row,
+          uint32_t subset_size,
+          std::string query_file,
+          std::string distance,
+          std::optional<std::string> groundtruth_neighbors_file,
+          std::optional<std::string> insert_file = std::nullopt,
+          std::optional<double> filtering_rate = std::nullopt)
     : name_{std::move(name)},
       distance_{std::move(distance)},
       base_set_{base_file, subset_first_row, subset_size},
       query_set_{query_file},
+      insert_set_{insert_file.has_value() ? std::make_optional<blob<DataT>>(insert_file.value())
+                                          : std::nullopt},
       ground_truth_set_{groundtruth_neighbors_file.has_value()
                           ? std::make_optional<blob<IdxT>>(groundtruth_neighbors_file.value())
                           : std::nullopt}
@@ -137,6 +161,21 @@ struct dataset {
     return r;
   }
 
+  [[nodiscard]] auto has_insert_set() const -> bool
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return insert_set_.has_value();
+  }
+
+  [[nodiscard]] auto insert_set_size() const -> size_t
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!insert_set_.has_value()) { return 0; }
+    auto r = insert_set_->n_rows();
+    cache_dim(*insert_set_);
+    return r;
+  }
+
   [[nodiscard]] auto gt_set() const -> const IdxT*
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -175,6 +214,30 @@ struct dataset {
     std::lock_guard<std::mutex> lock(mutex_);
     auto* r = base_set_.data(memory_type, request_hugepages_2mb);
     cache_dim(base_set_);
+    return r;
+  }
+
+  [[nodiscard]] auto insert_set() const -> const DataT*
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!insert_set_.has_value()) {
+      throw std::runtime_error("insert_set() requested but dataset.insert_file is not configured");
+    }
+    auto* r = insert_set_->data();
+    cache_dim(*insert_set_);
+    return r;
+  }
+
+  [[nodiscard]] auto insert_set(MemoryType memory_type,
+                                HugePages request_hugepages_2mb = HugePages::kDisable) const
+    -> const DataT*
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!insert_set_.has_value()) {
+      throw std::runtime_error("insert_set() requested but dataset.insert_file is not configured");
+    }
+    auto* r = insert_set_->data(memory_type, request_hugepages_2mb);
+    cache_dim(*insert_set_);
     return r;
   }
 

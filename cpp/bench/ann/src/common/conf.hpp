@@ -37,6 +37,7 @@ class configuration {
     uint32_t subset_first_row{0};
     uint32_t subset_size{0};
     std::string query_file;
+    std::optional<std::string> insert_file{std::nullopt};
     std::string distance;
     std::optional<std::string> groundtruth_neighbors_file{std::nullopt};
 
@@ -85,6 +86,10 @@ class configuration {
     dataset_conf_.name       = conf.at("name");
     dataset_conf_.base_file  = combine_path(data_prefix, conf.at("base_file"));
     dataset_conf_.query_file = combine_path(data_prefix, conf.at("query_file"));
+    if (conf.contains("insert_file") && conf.at("insert_file").is_string() &&
+        !conf.at("insert_file").get<std::string>().empty()) {
+      dataset_conf_.insert_file = combine_path(data_prefix, conf.at("insert_file"));
+    }
     dataset_conf_.distance   = conf.at("distance");
     if (conf.contains("filtering_rate")) {
       dataset_conf_.filtering_rate.emplace(conf.at("filtering_rate"));

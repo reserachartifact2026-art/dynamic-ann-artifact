@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -102,6 +103,7 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
   std::vector<uint64_t> ids(result_count, 0ULL);
   std::vector<uint32_t> neighbors(result_count, 0U);
   std::vector<float> distances(result_count, 0.0F);
+  uint64_t total_inserted = 0;
 
   auto run_search_phase = [&](const char* phase_label) {
     std::cout << "[freshbang_driver] " << phase_label << " (batch_size=" << batch_size
@@ -150,9 +152,44 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
       return true;
     }
 
+    // Keep a running, zero-based insert id sequence for skip-build mode.
+    std::vector<uint64_t> insert_ids;
+    const uint64_t* insert_ids_ptr = nullptr;
+    if (skip_build) {
+      insert_ids.resize(insert_batch_size);
+      for (uint32_t i = 0; i < insert_batch_size; ++i) {
+        insert_ids[i] = total_inserted + static_cast<uint64_t>(i);
+      }
+      insert_ids_ptr = insert_ids.data();
+      std::cout << "[freshbang_driver] Insert IDs range: [" << total_inserted << ", "
+                << (total_inserted + static_cast<uint64_t>(insert_batch_size) - 1) << "]"
+                << std::endl;
+    }
+
     std::cout << "[freshbang_driver] BatchedInsert(batch_size=" << insert_batch_size << ")"
               << std::endl;
-    freshbang.BatchedInsert(insert_vectors, insert_batch_size, nullptr);
+    freshbang.BatchedInsert(insert_vectors, insert_batch_size, insert_ids_ptr);
+    total_inserted += static_cast<uint64_t>(insert_batch_size);
+    return true;
+  };
+
+  auto run_delete_phase = [&]() -> bool {
+    if (total_inserted == 0) {
+      std::cout << "[freshbang_driver] No inserted IDs; skipping BatchedDelete" << std::endl;
+      return true;
+    }
+    if (total_inserted > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+      std::cerr << "[freshbang_driver] Too many inserted IDs for BatchedDelete: " << total_inserted
+                << std::endl;
+      return false;
+    }
+
+    std::vector<uint64_t> all_inserted_ids(total_inserted);
+    for (uint64_t i = 0; i < total_inserted; ++i) { all_inserted_ids[i] = i; }
+
+    std::cout << "[freshbang_driver] BatchedDelete(batch_size=" << total_inserted
+              << ") using all inserted IDs [0.." << (total_inserted - 1) << "]" << std::endl;
+    freshbang.BatchedDelete(all_inserted_ids.data(), static_cast<uint32_t>(total_inserted));
     return true;
   };
 
@@ -189,6 +226,18 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
   run_search_phase("BatchedSearch after insert");
   std::cout << "[freshbang_driver] Post-insert search pipeline completed" << std::endl;
 
+  if (!run_delete_phase()) {
+    return 1;
+  }
+
+  std::fill(ids.begin(), ids.end(), 0ULL);
+  std::fill(neighbors.begin(), neighbors.end(), 0U);
+  std::fill(distances.begin(), distances.end(), 0.0F);
+
+  run_search_phase("BatchedSearch after delete");
+  std::cout << "[freshbang_driver] Post-delete search pipeline completed" << std::endl;
+
+  
   // final cleanup
   freshbang.Cleanup();
   return 0;

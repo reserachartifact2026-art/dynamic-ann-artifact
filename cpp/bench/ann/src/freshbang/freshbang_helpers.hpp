@@ -297,9 +297,11 @@ inline auto get_dtype_string() -> std::string
 
 template <typename T>
 inline auto make_dataset(const configuration::dataset_conf& dataset_conf,
-                         bool use_filtering) -> std::shared_ptr<const dataset<T>>
+                         bool use_filtering,
+                         bool use_insert_set = false) -> std::shared_ptr<const dataset<T>>
 {
   auto filtering = use_filtering ? dataset_conf.filtering_rate : std::nullopt;
+  auto insert_file = use_insert_set ? dataset_conf.insert_file : std::nullopt;
   return std::make_shared<bench::dataset<T>>(dataset_conf.name,
                                              dataset_conf.base_file,
                                              dataset_conf.subset_first_row,
@@ -307,6 +309,7 @@ inline auto make_dataset(const configuration::dataset_conf& dataset_conf,
                                              dataset_conf.query_file,
                                              dataset_conf.distance,
                                              dataset_conf.groundtruth_neighbors_file,
+                                             insert_file,
                                              filtering);
 }
 

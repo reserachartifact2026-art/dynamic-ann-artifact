@@ -180,6 +180,15 @@ class algo : public algo_base {
   }
 
   /**
+   * Delete vectors from the index (optional, only supported by some algorithms like CAGRA).
+   * Default implementation throws to indicate unsupported operation.
+   */
+  virtual void delete_vectors(const uint64_t* /*ids*/, size_t /*num_ids*/)
+  {
+    throw std::runtime_error("Delete operation is not supported for this algorithm");
+  }
+
+  /**
    * Set insert parameters from JSON configuration (optional, for algorithms that support insert).
    * Default implementation is a no-op; algorithms supporting insert should override this.
    */

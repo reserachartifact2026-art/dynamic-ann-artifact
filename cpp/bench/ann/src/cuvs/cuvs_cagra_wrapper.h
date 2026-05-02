@@ -49,6 +49,14 @@
 
 namespace cuvs::bench {
 
+namespace detail {
+void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
+                                    size_t num_ids,
+                                    const uint32_t* graph,
+                                    int64_t graph_rows,
+                                    int64_t graph_cols);
+}
+
 enum class AllocatorType { kHostPinned, kHostHugePage, kDevice };
 enum class CagraBuildAlgo { kAuto, kIvfPq, kNnDescent };
 enum class CagraMergeType { kPhysical, kLogical };
@@ -113,6 +121,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
 
   void set_insert_param(const insert_param& param);
   void insert(const T* vectors, size_t num_vectors, const uint64_t* ids = nullptr) override;
+  void delete_vectors(const uint64_t* ids, size_t num_ids) override;
   void set_insert_param_from_json(const nlohmann::json& conf) override;
 
   void search(const T* queries,
@@ -190,6 +199,9 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   insert_param insert_params_{};
   bool has_inserted_data_{false};
   std::optional<std::string> graph_file_;
+  // START: For delete experiments
+  bool is_deleted_row_[10000] = {true};
+  // END: For delete experiments
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {
@@ -258,6 +270,10 @@ void cuvs_cagra<T, IdxT>::build(const T* dataset, size_t nrow)
       index_ = std::make_shared<cuvs::neighbors::cagra::index<T, IdxT>>(
         std::move(cuvs::neighbors::cagra::merge(handle_, params, indices)));
     }
+  }
+  // Mark all rows that we added now as not deleted
+  for (IdxT i = 0; i < nrow; ++i) {
+    is_deleted_row_[i] = false;
   }
 }
 
@@ -749,6 +765,9 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
     for (int64_t c = 0; c < cols; ++c) {
       host_graph[static_cast<size_t>(new_row_id * cols + c)] = adjacency[static_cast<size_t>(c)];
     }
+    // unset the is_deleted flag for the newly inserted row
+    is_deleted_row_[static_cast<size_t>(new_row_id)] = false;
+    
 
     // CONFLICT: std::cout is not thread-safe — protect with a named critical section.
     if (row < 3) {
@@ -969,6 +988,7 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
              stream);
   raft::resource::sync_stream(handle_);
   index_->update_graph(handle_, make_const_mdspan(graph_->view()));
+  
 
   *input_dataset_v_ = raft::make_device_matrix_view<const T, int64_t>(
     dataset_->data_handle(), dataset_->extent(0), this->dim_);
@@ -986,6 +1006,44 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
             << " graph_cols=" << cols
             << " dataset_rows=" << dataset_->extent(0)
             << std::endl;
+}
+
+
+template <typename T, typename IdxT>  
+void cuvs_cagra<T, IdxT>::delete_vectors(const uint64_t* ids, size_t num_ids)
+{
+  if (num_ids == 0) { return; }
+  if (ids == nullptr) {
+    throw std::runtime_error("delete requires a non-null ids pointer when num_ids > 0");
+  }
+  if (!index_) {
+    throw std::runtime_error("delete requires a valid index; call load/build before delete");
+  }
+
+  static_assert(sizeof(IdxT) == sizeof(uint32_t), "IdxT must be uint32_t for launch_cuvs_bang_delete_kernel");
+  
+  auto graph_view = index_->graph();
+  auto* graph_ptr = reinterpret_cast<const uint32_t*>(graph_view.data_handle());
+  auto graph_rows = graph_view.extent(0);
+  auto graph_cols = graph_view.extent(1);
+  auto* cached_graph_ptr = graph_ ? reinterpret_cast<const void*>(graph_->data_handle()) : nullptr;
+  auto cached_graph_rows = graph_ ? graph_->extent(0) : int64_t{0};
+  auto cached_graph_cols = graph_ ? graph_->extent(1) : int64_t{0};
+  std::printf(
+    "[delete_vectors] num_ids=%zu idx_graph_ptr=%p idx_rows=%lld idx_cols=%lld cached_graph_ptr=%p cached_rows=%lld cached_cols=%lld\n",
+    num_ids,
+    (const void*)graph_ptr,
+    (long long)graph_rows,
+    (long long)graph_cols,
+    cached_graph_ptr,
+    (long long)cached_graph_rows,
+    (long long)cached_graph_cols);
+  detail::launch_cuvs_bang_delete_kernel(ids, num_ids, graph_ptr, graph_rows, graph_cols);
+
+  for (size_t i = 0; i < num_ids; ++i) {
+    auto row = ids[i];
+    if (row < std::size(is_deleted_row_)) { is_deleted_row_[row] = true; }
+  }
 }
 
 /*
