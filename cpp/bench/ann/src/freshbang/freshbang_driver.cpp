@@ -5,12 +5,15 @@
 #include "freshbang_helpers.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,6 +45,38 @@ auto infer_dtype_from_base_file(const std::string& base_file) -> dataset_dtype
   return dataset_dtype::kUnknown;
 }
 
+auto read_dataset_rows_from_json(const std::string& conf_path) -> std::optional<uint32_t>
+{
+  std::ifstream conf_json_stream(conf_path);
+  if (!conf_json_stream) { return std::nullopt; }
+
+  auto conf_json = nlohmann::json::parse(conf_json_stream, nullptr, false);
+  if (conf_json.is_discarded() || !conf_json.contains("dataset") ||
+      !conf_json.at("dataset").is_object()) {
+    return std::nullopt;
+  }
+
+  const auto& dataset_json = conf_json.at("dataset");
+  if (!dataset_json.contains("rows")) { return std::nullopt; }
+
+  if (dataset_json.at("rows").is_number_unsigned()) {
+    auto rows_u64 = dataset_json.at("rows").get<uint64_t>();
+    if (rows_u64 <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+      return static_cast<uint32_t>(rows_u64);
+    }
+    return std::nullopt;
+  }
+
+  if (dataset_json.at("rows").is_number_integer()) {
+    auto rows_i64 = dataset_json.at("rows").get<int64_t>();
+    if (rows_i64 > 0 && rows_i64 <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+      return static_cast<uint32_t>(rows_i64);
+    }
+  }
+
+  return std::nullopt;
+}
+
 template <typename T>
 auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_conf,
                         const std::string& conf_path,
@@ -54,12 +89,15 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
     dataset_conf.base_file, dataset_conf.subset_first_row, dataset_conf.subset_size);
 
   BuildParams build_params;
+  auto rows_from_config      = read_dataset_rows_from_json(conf_path);
+  build_params.dataset_rows  = rows_from_config.value_or(static_cast<uint32_t>(base_blob.n_rows()));
   build_params.dataset_dim      = base_blob.n_cols();
   build_params.distance_measure = dataset_conf.distance;
 
   FreshBANG<T> freshbang;
 
-  std::cout << "[freshbang_driver] SetDatasetParams(dim=" << build_params.dataset_dim
+  std::cout << "[freshbang_driver] SetDatasetParams(rows=" << build_params.dataset_rows
+            << ", dim=" << build_params.dataset_dim
             << ", distance=" << build_params.distance_measure << ")" << std::endl;
   if (!freshbang.SetDatasetParams(build_params)) {
     std::cerr << "[freshbang_driver] SetDatasetParams failed" << std::endl;
@@ -103,15 +141,30 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
   std::vector<uint64_t> ids(result_count, 0ULL);
   std::vector<uint32_t> neighbors(result_count, 0U);
   std::vector<float> distances(result_count, 0.0F);
-  uint64_t total_inserted = 0;
+  uint64_t next_insert_id = 0;
 
-  auto run_search_phase = [&](const char* phase_label) {
+  if (!skip_build) {
+    next_insert_id = static_cast<uint64_t>(base_blob.n_rows());
+    if (next_insert_id > 0) {
+      std::cout << "[freshbang_driver] Build consumed base IDs [0.." << (next_insert_id - 1)
+                << "]; insert IDs will start at " << next_insert_id << std::endl;
+    }
+  }
+
+  auto run_search_phase = [&](const char* phase_label) -> double {
     std::cout << "[freshbang_driver] " << phase_label << " (batch_size=" << batch_size
               << ", k=" << search_params.recall_at_k << ")" << std::endl;
+    auto t0 = std::chrono::steady_clock::now();
     freshbang.BatchedSearch(query_set, batch_size, ids.data(), neighbors.data(), distances.data());
+    auto t1      = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration<double>(t1 - t0).count();
+    auto qps     = elapsed > 0.0 ? static_cast<double>(batch_size) / elapsed : 0.0;
+    std::cout << "[freshbang_driver] " << phase_label << " elapsed_sec=" << elapsed
+              << " qps=" << qps << std::endl;
+    return elapsed;
   };
 
-  auto run_insert_phase = [&]() -> bool {
+  auto run_insert_phase = [&](std::vector<uint64_t>& inserted_ids_out) -> bool {
     std::cout << "[freshbang_driver] SetInsertParams()" << std::endl;
     if (!freshbang.SetInsertParams()) {
       std::cerr << "[freshbang_driver] SetInsertParams failed" << std::endl;
@@ -152,44 +205,64 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
       return true;
     }
 
-    // Keep a running, zero-based insert id sequence for skip-build mode.
+    // Keep a running, zero-based insert id sequence for all insert flows.
+    // Even though the current cagra insert implementation ignores ids, future
+    // implementations are expected to consume them.
     std::vector<uint64_t> insert_ids;
-    const uint64_t* insert_ids_ptr = nullptr;
-    if (skip_build) {
-      insert_ids.resize(insert_batch_size);
-      for (uint32_t i = 0; i < insert_batch_size; ++i) {
-        insert_ids[i] = total_inserted + static_cast<uint64_t>(i);
-      }
-      insert_ids_ptr = insert_ids.data();
-      std::cout << "[freshbang_driver] Insert IDs range: [" << total_inserted << ", "
-                << (total_inserted + static_cast<uint64_t>(insert_batch_size) - 1) << "]"
-                << std::endl;
+    insert_ids.resize(insert_batch_size);
+    for (uint32_t i = 0; i < insert_batch_size; ++i) {
+      insert_ids[i] = next_insert_id + static_cast<uint64_t>(i);
     }
+    const uint64_t* insert_ids_ptr = insert_ids.data();
+    std::cout << "[freshbang_driver] Insert IDs range: [" << next_insert_id << ", "
+              << (next_insert_id + static_cast<uint64_t>(insert_batch_size) - 1) << "]"
+              << std::endl;
 
     std::cout << "[freshbang_driver] BatchedInsert(batch_size=" << insert_batch_size << ")"
               << std::endl;
+
+    if (skip_build) {
+      const auto& indices = conf.get_indices();
+      if (!indices.empty()) {
+        const auto& index_file = indices.front().file;
+        if (std::filesystem::exists(index_file)) {
+          std::cout << "[freshbang_driver] --skipbuild removing existing index file: "
+                    << index_file << std::endl;
+          std::filesystem::remove(index_file);
+        }
+      }
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
     freshbang.BatchedInsert(insert_vectors, insert_batch_size, insert_ids_ptr);
-    total_inserted += static_cast<uint64_t>(insert_batch_size);
+    auto t1      = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration<double>(t1 - t0).count();
+    auto qps     = elapsed > 0.0 ? static_cast<double>(insert_batch_size) / elapsed : 0.0;
+    std::cout << "[freshbang_driver] BatchedInsert elapsed_sec=" << elapsed
+              << " qps=" << qps << std::endl;
+
+    inserted_ids_out = insert_ids;
+    next_insert_id += static_cast<uint64_t>(insert_batch_size);
     return true;
   };
 
-  auto run_delete_phase = [&]() -> bool {
-    if (total_inserted == 0) {
+  auto run_delete_phase = [&](const std::vector<uint64_t>& ids_to_delete) -> bool {
+    if (ids_to_delete.empty()) {
       std::cout << "[freshbang_driver] No inserted IDs; skipping BatchedDelete" << std::endl;
       return true;
     }
-    if (total_inserted > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
-      std::cerr << "[freshbang_driver] Too many inserted IDs for BatchedDelete: " << total_inserted
-                << std::endl;
-      return false;
-    }
 
-    std::vector<uint64_t> all_inserted_ids(total_inserted);
-    for (uint64_t i = 0; i < total_inserted; ++i) { all_inserted_ids[i] = i; }
+    std::cout << "[freshbang_driver] BatchedDelete(batch_size=" << ids_to_delete.size()
+              << ") using inserted IDs [" << ids_to_delete.front() << ".."
+              << ids_to_delete.back() << "]" << std::endl;
 
-    std::cout << "[freshbang_driver] BatchedDelete(batch_size=" << total_inserted
-              << ") using all inserted IDs [0.." << (total_inserted - 1) << "]" << std::endl;
-    freshbang.BatchedDelete(all_inserted_ids.data(), static_cast<uint32_t>(total_inserted));
+    auto t0 = std::chrono::steady_clock::now();
+    freshbang.BatchedDelete(ids_to_delete.data(), static_cast<uint32_t>(ids_to_delete.size()));
+    auto t1      = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration<double>(t1 - t0).count();
+    auto qps     = elapsed > 0.0 ? static_cast<double>(ids_to_delete.size()) / elapsed : 0.0;
+    std::cout << "[freshbang_driver] BatchedDelete elapsed_sec=" << elapsed
+              << " qps=" << qps << std::endl;
     return true;
   };
 
@@ -206,40 +279,45 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
     std::cout << "[freshbang_driver] Search pipeline completed" << std::endl;
   }
 
-  if (!run_insert_phase()) {
-    return 1;
-  }
+  constexpr int kPipelineRuns = 3;
+  for (int run = 1; run <= kPipelineRuns; ++run) {
+    std::cout << "[freshbang_driver] ===== Pipeline Run " << run << "/" << kPipelineRuns
+              << " =====" << std::endl;
 
-  if (skip_build) {
-    std::cout << "[freshbang_driver] SetSearchParams(recall_at_k=" << search_params.recall_at_k
-              << ") after insert" << std::endl;
-    if (!freshbang.SetSearchParams(search_params)) {
-      std::cerr << "[freshbang_driver] SetSearchParams failed" << std::endl;
+    std::vector<uint64_t> inserted_ids_for_delete;
+    if (!run_insert_phase(inserted_ids_for_delete)) {
       return 1;
     }
+
+    if (skip_build && run == 1) {
+      std::cout << "[freshbang_driver] SetSearchParams(recall_at_k=" << search_params.recall_at_k
+                << ") after first insert" << std::endl;
+      if (!freshbang.SetSearchParams(search_params)) {
+        std::cerr << "[freshbang_driver] SetSearchParams failed" << std::endl;
+        return 1;
+      }
+    }
+
+    std::fill(ids.begin(), ids.end(), 0ULL);
+    std::fill(neighbors.begin(), neighbors.end(), 0U);
+    std::fill(distances.begin(), distances.end(), 0.0F);
+    run_search_phase("BatchedSearch after insert");
+    std::cout << "[freshbang_driver] Post-insert search pipeline completed" << std::endl;
+
+    if (!run_delete_phase(inserted_ids_for_delete)) {
+      return 1;
+    }
+
+    std::fill(ids.begin(), ids.end(), 0ULL);
+    std::fill(neighbors.begin(), neighbors.end(), 0U);
+    std::fill(distances.begin(), distances.end(), 0.0F);
+    run_search_phase("BatchedSearch after delete");
+    std::cout << "[freshbang_driver] Post-delete search pipeline completed" << std::endl;
   }
-
-  std::fill(ids.begin(), ids.end(), 0ULL);
-  std::fill(neighbors.begin(), neighbors.end(), 0U);
-  std::fill(distances.begin(), distances.end(), 0.0F);
-
-  run_search_phase("BatchedSearch after insert");
-  std::cout << "[freshbang_driver] Post-insert search pipeline completed" << std::endl;
-
-  if (!run_delete_phase()) {
-    return 1;
-  }
-
-  std::fill(ids.begin(), ids.end(), 0ULL);
-  std::fill(neighbors.begin(), neighbors.end(), 0U);
-  std::fill(distances.begin(), distances.end(), 0.0F);
-
-  run_search_phase("BatchedSearch after delete");
-  std::cout << "[freshbang_driver] Post-delete search pipeline completed" << std::endl;
 
   
   // final cleanup
-  freshbang.Cleanup();
+  //freshbang.Cleanup();
   return 0;
 }
 

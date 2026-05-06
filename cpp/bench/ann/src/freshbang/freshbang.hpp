@@ -11,6 +11,7 @@ typedef struct _SearchParams
 
 typedef struct _BuildParams
 {
+     uint32_t dataset_rows;
     uint32_t dataset_dim;
     std::string distance_measure;
 } BuildParams;
@@ -57,7 +58,7 @@ public:
     // Concurrent operations (e.g., search and insert at the same time) are not supported in this version.
 
     // Note on IDs: These are actually slots IDs. Always in range 0 - N-1 and re-used across deletes and inserts. 
-    
+
     void BatchedSearch(const T* searchvectors, 
                         uint32_t batch_size,
                         uint64_t* ids,

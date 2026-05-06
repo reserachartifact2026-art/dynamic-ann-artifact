@@ -203,6 +203,9 @@ class FreshBANGInner {
   void set_prefer_insert_dataset_for_search(bool value) { prefer_insert_dataset_for_search_ = value; }
   bool prefer_insert_dataset_for_search() const { return prefer_insert_dataset_for_search_; }
 
+  void set_has_live_index(bool value) { has_live_index_ = value; }
+  bool has_live_index() const { return has_live_index_; }
+
  private:
   std::string conf_path_;
   std::string data_prefix_;
@@ -214,6 +217,7 @@ class FreshBANGInner {
   cuvs::bench::algo_property algo_property_{};
   std::shared_ptr<const cuvs::bench::dataset<T>> search_dataset_;
   bool prefer_insert_dataset_for_search_{false};
+  bool has_live_index_{false};
 };
 
 }  // namespace detail
@@ -243,7 +247,8 @@ FreshBANG<T>::~FreshBANG()
 template <typename T>
 bool FreshBANG<T>::SetDatasetParams(BuildParams params)
 {
-  std::cout << "[FreshBANG::SetDatasetParams] dataset_dim=" << params.dataset_dim
+  std::cout << "[FreshBANG::SetDatasetParams] dataset_rows=" << params.dataset_rows
+            << " dataset_dim=" << params.dataset_dim
             << " distance_measure=" << params.distance_measure << std::endl;
   user_build_params_ = std::move(params);
   return true;
@@ -280,11 +285,13 @@ bool FreshBANG<T>::CreateAlgo()
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
 
   std::cout << "[FreshBANG::CreateAlgo] Calling invoke_create_algo for algo='" << index.algo
-            << "' distance='" << user_build_params_.distance_measure << "' dim="
+            << "' distance='" << user_build_params_.distance_measure << "' rows="
+            << user_build_params_.dataset_rows << " dim="
             << user_build_params_.dataset_dim << std::endl;
 
   auto algo = cuvs::bench::detail::invoke_create_algo<T>(index.algo,
                                                           user_build_params_.distance_measure,
+                                                          static_cast<int>(user_build_params_.dataset_rows),
                                                           static_cast<int>(user_build_params_.dataset_dim),
                                                           index.build_param);
 
@@ -366,6 +373,7 @@ bool FreshBANG<T>::BuildIndex(const T* base_vectors, uint32_t num_basevectors)
   std::cout << "[FreshBANG::BuildIndex] Calling save('" << impl->index_file() << "')" << std::endl;
   algo_obj->save(impl->index_file());
   std::cout << "[FreshBANG::BuildIndex] save() completed" << std::endl;
+  impl->set_has_live_index(true);
 
   return true;
 }
@@ -657,6 +665,13 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
     return;
   }
 
+  // Debug: print first 10 components of first insert vector
+  std::cout << "[FreshBANG::BatchedInsert] First insert vector (first 10 components): ";
+  for (int i = 0; i < std::min(10, static_cast<int>(user_build_params_.dataset_dim)); ++i) {
+    std::cout << static_cast<double>(insertvectors[i]) << " ";
+  }
+  std::cout << std::endl;
+
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
   auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
                                                             impl->algo_name(),
@@ -674,21 +689,26 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
     return;
   }
 
-  // If an index exists on disk, load it into the fresh algo instance before insert.
+  // If an index exists on disk, load it into a fresh algo instance before insert.
+  // Skip load when a valid in-process index is already available from BuildIndex/previous ops.
   bool has_index_on_disk = cuvs::bench::detail::file_exists(impl->index_file());
   bool use_build_path    = !has_index_on_disk;
-  if (has_index_on_disk) {
+  if (has_index_on_disk && !impl->has_live_index()) {
     try {
       std::cout << "[FreshBANG::BatchedInsert] Loading existing index from '"
                 << impl->index_file() << "' before insert" << std::endl;
       algo_obj->load(impl->index_file());
       std::cout << "[FreshBANG::BatchedInsert] load() completed" << std::endl;
+      impl->set_has_live_index(true);
     } catch (const std::exception& e) {
       std::cerr << "[FreshBANG::BatchedInsert] Warning: failed to load existing index '"
                 << impl->index_file() << "': " << e.what()
                 << ". Falling back to build operation." << std::endl;
       use_build_path = true;
     }
+  } else if (has_index_on_disk && impl->has_live_index()) {
+    std::cout << "[FreshBANG::BatchedInsert] Skipping load(); using in-memory index built in this process"
+              << std::endl;
   }
 
   // Special case: if no index exists on disk (or load failed), treat insert as build.
@@ -711,6 +731,7 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
     std::cout << "[FreshBANG::BatchedInsert] Calling save('" << impl->index_file() << "')" << std::endl;
     algo_obj->save(impl->index_file());
     std::cout << "[FreshBANG::BatchedInsert] save() completed" << std::endl;
+    impl->set_has_live_index(true);
     impl->set_prefer_insert_dataset_for_search(true);
     // ToDo: check if we can assign hostside insertvectors like this directly.
 /*        algo_obj->set_search_dataset(insertvectors,
@@ -770,7 +791,7 @@ void FreshBANG<T>::BatchedDelete(const uint64_t* ids, uint32_t batch_size)
 
   algo_obj->delete_vectors(ids, static_cast<size_t>(batch_size));
   algo_obj->save(impl->index_file());
-  std::cout << "[FreshBANG::BatchedDelete] delete() completed" << std::endl;
+  std::cout << "[FreshBANG::BatchedDelete] delete() completed with index saved" << std::endl;
 }
 
 template <typename T>

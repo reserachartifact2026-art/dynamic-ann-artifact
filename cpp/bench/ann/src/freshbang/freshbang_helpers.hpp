@@ -114,24 +114,24 @@ inline auto normalize_prefix(const std::string& prefix, const std::string& fallb
 // ---------------------------------------------------------------------------
 
 template <typename T>
-inline std::string get_create_algo_c_symbol_name();
+inline std::string get_create_algo_rows_c_symbol_name();
 
 template <>
-inline std::string get_create_algo_c_symbol_name<float>()
+inline std::string get_create_algo_rows_c_symbol_name<float>()
 {
-  return "cuvs_bench_create_algo_float";
+  return "cuvs_bench_create_algo_with_rows_float";
 }
 
 template <>
-inline std::string get_create_algo_c_symbol_name<std::uint8_t>()
+inline std::string get_create_algo_rows_c_symbol_name<std::uint8_t>()
 {
-  return "cuvs_bench_create_algo_uint8";
+  return "cuvs_bench_create_algo_with_rows_uint8";
 }
 
 template <>
-inline std::string get_create_algo_c_symbol_name<std::int8_t>()
+inline std::string get_create_algo_rows_c_symbol_name<std::int8_t>()
 {
-  return "cuvs_bench_create_algo_int8";
+  return "cuvs_bench_create_algo_with_rows_int8";
 }
 
 // Mangled fallback symbol names (for backwards compat with older .so files)
@@ -168,35 +168,51 @@ inline std::string get_create_algo_symbol_name<std::int8_t>()
 template <typename T>
 inline auto invoke_create_algo(const std::string& algo,
                                const std::string& distance,
+                               int rows,
                                int dim,
                                const nlohmann::json& conf) -> std::unique_ptr<cuvs::bench::algo<T>>
 {
 #ifdef _WIN32
   (void)algo;
   (void)distance;
+  (void)rows;
   (void)dim;
   (void)conf;
   throw std::runtime_error("Dynamic loading is not supported on Windows.");
 #else
-  auto c_fname      = get_create_algo_c_symbol_name<T>();
-  auto mangled_name = get_create_algo_symbol_name<T>();
-  auto handle       = load_lib_raft_compat(algo);
-  auto fun_addr     = dlsym(handle, c_fname.c_str());
-  std::cerr << "[DEBUG] dlsym attempt 1 - C symbol: " << c_fname.substr(0, 50) << "... : " << (fun_addr != nullptr ? "FOUND" : "NOT FOUND") << std::endl;
-  if (fun_addr == nullptr) {
-    fun_addr = dlsym(handle, mangled_name.c_str());
-    std::cerr << "[DEBUG] dlsym attempt 2 - Mangled symbol: " << mangled_name.substr(0, 50) << "... : " << (fun_addr != nullptr ? "FOUND" : "NOT FOUND") << std::endl;
+  auto rows_c_fname       = get_create_algo_rows_c_symbol_name<T>();
+  auto legacy_mangled_name = get_create_algo_symbol_name<T>();
+  auto handle             = load_lib_raft_compat(algo);
+  auto fun_addr           = dlsym(handle, rows_c_fname.c_str());
+  std::cerr << "[DEBUG] dlsym attempt 1 - rows C symbol: " << rows_c_fname.substr(0, 50)
+            << "... : " << (fun_addr != nullptr ? "FOUND" : "NOT FOUND") << std::endl;
+  if (fun_addr != nullptr) {
+    using create_algo_with_rows_fn_t =
+      std::unique_ptr<cuvs::bench::algo<T>> (*)(const std::string&,
+                                                const std::string&,
+                                                int,
+                                                int,
+                                                const nlohmann::json&);
+    auto fun = reinterpret_cast<create_algo_with_rows_fn_t>(fun_addr);
+    return fun(algo, distance, rows, dim, conf);
   }
+
+  fun_addr = dlsym(handle, legacy_mangled_name.c_str());
+  std::cerr << "[DEBUG] dlsym attempt 2 - legacy mangled symbol: "
+            << legacy_mangled_name.substr(0, 50) << "... : "
+            << (fun_addr != nullptr ? "FOUND" : "NOT FOUND") << std::endl;
   if (fun_addr == nullptr) {
     throw std::runtime_error("Couldn't load the create_algo function (" + algo + "): " +
                              std::string(dlerror()));
   }
-  using create_algo_fn_t =
+  using legacy_create_algo_fn_t =
     std::unique_ptr<cuvs::bench::algo<T>> (*)(const std::string&,
                                               const std::string&,
                                               int,
                                               const nlohmann::json&);
-  auto fun = reinterpret_cast<create_algo_fn_t>(fun_addr);
+  auto fun = reinterpret_cast<legacy_create_algo_fn_t>(fun_addr);
+  std::cerr << "[DEBUG] using legacy create_algo ABI without rows support for algo='" << algo
+            << "'" << std::endl;
   return fun(algo, distance, dim, conf);
 #endif
 }
