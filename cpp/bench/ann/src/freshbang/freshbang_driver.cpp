@@ -5,6 +5,7 @@
 #include "freshbang_helpers.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -20,6 +21,62 @@
 namespace {
 
 enum class dataset_dtype { kFloat32, kInt32, kUInt8, kInt8, kUnknown };
+#define PIPELINE_RUNS 0 // > 1, not working now
+
+struct DriverConfig {
+  std::string data_prefix;
+  std::string index_prefix;
+};
+
+auto read_freshbang_config(const std::string& config_file = "freshbang.cfg")
+  -> std::pair<bool, DriverConfig>
+{
+  std::ifstream conf_stream(config_file);
+  DriverConfig config{};
+
+  if (!conf_stream) {
+    std::cerr << "[freshbang_driver] Warning: " << config_file << " not found, using current "
+                 "directory as defaults"
+              << std::endl;
+    config.data_prefix  = ".";
+    config.index_prefix = ".";
+    return {true, config};
+  }
+
+  std::string line;
+  while (std::getline(conf_stream, line)) {
+    // Trim whitespace
+    line.erase(0, line.find_first_not_of(" \t\r\n"));
+    line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+    // Skip comments and empty lines
+    if (line.empty() || line[0] == '#') { continue; }
+
+    size_t delimiter_pos = line.find('=');
+    if (delimiter_pos == std::string::npos) { continue; }
+
+    std::string key   = line.substr(0, delimiter_pos);
+    std::string value = line.substr(delimiter_pos + 1);
+
+    // Trim key and value
+    key.erase(key.find_last_not_of(" \t") + 1);
+    value.erase(0, value.find_first_not_of(" \t"));
+
+    if (key == "data_prefix") {
+      config.data_prefix = value;
+    } else if (key == "index_prefix") {
+      config.index_prefix = value;
+    }
+  }
+
+  if (config.data_prefix.empty() || config.index_prefix.empty()) {
+    std::cerr << "[freshbang_driver] Error: " << config_file
+              << " must contain 'data_prefix' and 'index_prefix'" << std::endl;
+    return {false, config};
+  }
+
+  return {true, config};
+}
 
 auto to_lower(std::string s) -> std::string
 {
@@ -78,12 +135,12 @@ auto read_dataset_rows_from_json(const std::string& conf_path) -> std::optional<
 }
 
 template <typename T>
-auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_conf,
-                        const std::string& conf_path,
-                        const std::string& data_prefix,
-                        const std::string& index_prefix,
-                        uint32_t recall_at_k,
-                        bool skip_build) -> int
+auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
+                  const std::string& conf_path,
+                  const std::string& data_prefix,
+                  const std::string& index_prefix,
+                  uint32_t recall_at_k,
+                  bool skip_build) -> int
 {
   cuvs::bench::blob<T> base_blob(
     dataset_conf.base_file, dataset_conf.subset_first_row, dataset_conf.subset_size);
@@ -104,16 +161,17 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
     return 1;
   }
 
-  std::cout << "[freshbang_driver] CreateAlgo()" << std::endl;
-  if (!freshbang.CreateAlgo()) {
+  std::cout << "[freshbang_driver] CreateAlgo(conf_path=" << conf_path << ")" << std::endl;
+  if (!freshbang.CreateAlgo(conf_path)) {
     std::cerr << "[freshbang_driver] CreateAlgo failed" << std::endl;
     return 1;
   }
 
   if (!skip_build) {
-    std::cout << "[freshbang_driver] BuildIndex(rows=" << base_blob.n_rows()
+    std::cout << "[freshbang_driver] BuildIndex(rows=1000 out of " << base_blob.n_rows()
               << ", cols=" << base_blob.n_cols() << ")" << std::endl;
-    if (!freshbang.BuildIndex(base_blob.data(), base_blob.n_rows())) {
+    //if (!freshbang.BuildIndex(base_blob.data(), base_blob.n_rows())) {
+ if (!freshbang.BuildIndex(base_blob.data(), 1000)) {
       std::cerr << "[freshbang_driver] BuildIndex failed" << std::endl;
       return 1;
     }
@@ -129,8 +187,9 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
   auto& conf = cuvs::bench::configuration::initialize(conf_stream, data_prefix, index_prefix);
   auto dataset = cuvs::bench::make_dataset<T>(conf.get_dataset_conf(), true);
 
-  //const T* query_set = dataset->query_set(cuvs::bench::MemoryType::kDevice);
-  const T* query_set = dataset->query_set();
+  // search query had to be on device memory for freshbang since it doesn't support host memory input 
+  //Not the case anymore.
+  const T* query_set = dataset->query_set(cuvs::bench::MemoryType::kDevice);
   const uint32_t batch_size =
     std::min<uint32_t>(static_cast<uint32_t>(dataset->query_set_size()), 10000U);
 
@@ -142,9 +201,21 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
   std::vector<uint32_t> neighbors(result_count, 0U);
   std::vector<float> distances(result_count, 0.0F);
   uint64_t next_insert_id = 0;
+  uint64_t min_insert_id  = 0;
+  const std::string results_file = "search_results_ids.txt";
+
+  {
+    std::ofstream clear_stream(results_file, std::ios::trunc);
+    if (!clear_stream) {
+      std::cerr << "[freshbang_driver] Failed to create results file: " << results_file
+                << std::endl;
+      return 1;
+    }
+  }
 
   if (!skip_build) {
     next_insert_id = static_cast<uint64_t>(base_blob.n_rows());
+    min_insert_id  = next_insert_id;
     if (next_insert_id > 0) {
       std::cout << "[freshbang_driver] Build consumed base IDs [0.." << (next_insert_id - 1)
                 << "]; insert IDs will start at " << next_insert_id << std::endl;
@@ -156,12 +227,33 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
               << ", k=" << search_params.recall_at_k << ")" << std::endl;
     auto t0 = std::chrono::steady_clock::now();
     freshbang.BatchedSearch(query_set, batch_size, ids.data(), neighbors.data(), distances.data());
+
     auto t1      = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration<double>(t1 - t0).count();
     auto qps     = elapsed > 0.0 ? static_cast<double>(batch_size) / elapsed : 0.0;
     std::cout << "[freshbang_driver] " << phase_label << " elapsed_sec=" << elapsed
               << " qps=" << qps << std::endl;
     return elapsed;
+  };
+
+  auto dump_ids_to_file = [&](uint32_t query_count) -> bool {
+    std::ofstream results_stream(results_file, std::ios::app);
+    if (!results_stream) {
+      std::cerr << "[freshbang_driver] Failed to open results file for append: "
+                << results_file << std::endl;
+      return false;
+    }
+
+    for (uint32_t query_idx = 0; query_idx < query_count; ++query_idx) {
+      const std::size_t row_offset = static_cast<std::size_t>(query_idx) * search_params.recall_at_k;
+      for (uint32_t rank = 0; rank < search_params.recall_at_k; ++rank) {
+        if (rank > 0) { results_stream << ","; }
+        results_stream << ids[row_offset + rank];
+      }
+      results_stream << '\n';
+    }
+
+    return true;
   };
 
   auto run_insert_phase = [&](std::vector<uint64_t>& inserted_ids_out) -> bool {
@@ -263,6 +355,16 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
     auto qps     = elapsed > 0.0 ? static_cast<double>(ids_to_delete.size()) / elapsed : 0.0;
     std::cout << "[freshbang_driver] BatchedDelete elapsed_sec=" << elapsed
               << " qps=" << qps << std::endl;
+
+    // Keep insert ID allocation stable across insert-delete cycles.
+    auto deleted_count = static_cast<uint64_t>(ids_to_delete.size());
+    if (next_insert_id >= deleted_count) {
+      next_insert_id -= deleted_count;
+    } else {
+      next_insert_id = min_insert_id;
+    }
+    if (next_insert_id < min_insert_id) { next_insert_id = min_insert_id; }
+
     return true;
   };
 
@@ -276,13 +378,20 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
 
     // Note: query_set can be on host or device. CAGRA wrapper will handle copying if needed.
     run_search_phase("BatchedSearch");
+    if (!dump_ids_to_file(batch_size)) {
+      return 1;
+    }
     std::cout << "[freshbang_driver] Search pipeline completed" << std::endl;
+
+
   }
 
-  constexpr int kPipelineRuns = 3;
+  constexpr int kPipelineRuns = PIPELINE_RUNS;
   for (int run = 1; run <= kPipelineRuns; ++run) {
     std::cout << "[freshbang_driver] ===== Pipeline Run " << run << "/" << kPipelineRuns
               << " =====" << std::endl;
+
+
 
     std::vector<uint64_t> inserted_ids_for_delete;
     if (!run_insert_phase(inserted_ids_for_delete)) {
@@ -302,6 +411,9 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
     std::fill(neighbors.begin(), neighbors.end(), 0U);
     std::fill(distances.begin(), distances.end(), 0.0F);
     run_search_phase("BatchedSearch after insert");
+    if (!dump_ids_to_file(batch_size)) {
+      return 1;
+    }
     std::cout << "[freshbang_driver] Post-insert search pipeline completed" << std::endl;
 
     if (!run_delete_phase(inserted_ids_for_delete)) {
@@ -312,10 +424,12 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
     std::fill(neighbors.begin(), neighbors.end(), 0U);
     std::fill(distances.begin(), distances.end(), 0.0F);
     run_search_phase("BatchedSearch after delete");
+    if (!dump_ids_to_file(batch_size)) {
+      return 1;
+    }
     std::cout << "[freshbang_driver] Post-delete search pipeline completed" << std::endl;
-  }
+  } 
 
-  
   // final cleanup
   //freshbang.Cleanup();
   return 0;
@@ -325,14 +439,13 @@ auto run_build_pipeline(const cuvs::bench::configuration::dataset_conf& dataset_
 
 int main(int argc, char** argv)
 {
-  if (argc != 5 && argc != 6) {
-    std::cerr << "Usage: " << argv[0]
-              << " <conf_path> <dataset_prefix> <index_prefix> <recall_at_k> [--skipbuild]"
-              << std::endl;
+  if (argc < 3 || argc > 4) {
+    std::cerr << "Usage: " << argv[0] << " <conf_path> <recall_at_k> [--skipbuild]" << std::endl;
     std::cerr << "\nOptional flags:" << std::endl;
     std::cerr << "  --skipbuild     Skip BuildIndex and call BatchedInsert first." << std::endl;
     std::cerr << "                  This is intended to test the special-case path where" << std::endl;
-    std::cerr << "                  BatchedInsert behaves like build/save when no index exists." << std::endl;
+    std::cerr << "                  BatchedInsert behaves like build/save when no index exists." 
+              << std::endl;
     std::cerr << "\nDefault phases: SetDatasetParams → CreateAlgo → BuildIndex"
                  " → SetSearchParams → BatchedSearch → SetInsertParams"
                  " → BatchedInsert → BatchedSearch"
@@ -343,9 +456,16 @@ int main(int argc, char** argv)
               << std::endl;
     std::cerr << "\nRequired Parameters:" << std::endl;
     std::cerr << "  conf_path       - Path to JSON configuration file" << std::endl;
-    std::cerr << "  dataset_prefix  - Prefix prepended to base_file paths in config" << std::endl;
-    std::cerr << "  index_prefix    - Prefix prepended to index file paths in config" << std::endl;
     std::cerr << "  recall_at_k     - Search K to pass into SetSearchParams" << std::endl;
+    std::cerr << "\nConfiguration:" << std::endl;
+    std::cerr << "  Data and index prefixes are read from 'freshbang.cfg' in the current "
+                 "directory." << std::endl;
+    std::cerr << "  Required keys in freshbang.cfg:" << std::endl;
+    std::cerr << "    data_prefix     - Prefix prepended to dataset paths in config" << std::endl;
+    std::cerr << "    index_prefix    - Prefix prepended to index file paths in config" << std::endl;
+    std::cerr << "\nExample freshbang.cfg:" << std::endl;
+    std::cerr << "  data_prefix=/path/to/datasets/" << std::endl;
+    std::cerr << "  index_prefix=/path/to/indices/" << std::endl;
     std::cerr << "\nSupported Data Types (inferred from base_file extension):" << std::endl;
     std::cerr << "  .fbin           - float32 (✓ supported)" << std::endl;
     std::cerr << "  .ibin           - int32 (requires FreshBANG<int32_t> instantiation)" << std::endl;
@@ -360,23 +480,21 @@ int main(int argc, char** argv)
     return 2;
   }
 
-  const std::string conf_path    = argv[1];
-  const std::string data_prefix  = argv[2];
-  const std::string index_prefix = argv[3];
-  const bool skip_build          = (argc == 6);
+  const std::string conf_path = argv[1];
+  const bool skip_build       = (argc == 4);
 
-  if (skip_build && std::string(argv[5]) != "--skipbuild") {
-    std::cerr << "[freshbang_driver] Unknown argument: '" << argv[5]
+  if (skip_build && std::string(argv[3]) != "--skipbuild") {
+    std::cerr << "[freshbang_driver] Unknown argument: '" << argv[3]
               << "'. Did you mean --skipbuild ?" << std::endl;
     return 2;
   }
 
-  uint32_t recall_at_k           = 0;
+  uint32_t recall_at_k = 0;
 
   try {
-    recall_at_k = static_cast<uint32_t>(std::stoul(argv[4]));
+    recall_at_k = static_cast<uint32_t>(std::stoul(argv[2]));
   } catch (const std::exception&) {
-    std::cerr << "[freshbang_driver] Invalid recall_at_k: '" << argv[4]
+    std::cerr << "[freshbang_driver] Invalid recall_at_k: '" << argv[2]
               << "'. It must be a positive integer." << std::endl;
     return 2;
   }
@@ -384,6 +502,29 @@ int main(int argc, char** argv)
     std::cerr << "[freshbang_driver] recall_at_k must be greater than zero." << std::endl;
     return 2;
   }
+
+  // Enable debug logging for RAFT without taking a rapids_logger link dependency.
+  setenv("RAFT_LOG_LEVEL", "debug", 1);
+  setenv("RAPIDS_LOG_LEVEL", "debug", 1);
+  setenv("RAPIDS_LOGGER_LOG_LEVEL", "debug", 1);
+  setenv("SPDLOG_LEVEL", "debug", 1);
+
+  // Read data_prefix and index_prefix from freshbang.cfg
+  auto [config_ok, driver_config] = read_freshbang_config();
+  if (!config_ok) {
+    std::cerr << "[freshbang_driver] Failed to read freshbang.cfg" << std::endl;
+    return 1;
+  }
+
+  const std::string data_prefix  = driver_config.data_prefix;
+  const std::string index_prefix = driver_config.index_prefix;
+
+  std::cout << "[freshbang_driver] Config loaded:" << std::endl
+            << "  conf_path=" << conf_path << std::endl
+            << "  data_prefix=" << data_prefix << std::endl
+            << "  index_prefix=" << index_prefix << std::endl
+            << "  recall_at_k=" << recall_at_k << std::endl
+            << "  skip_build=" << (skip_build ? "true" : "false") << std::endl;
 
   try {
     auto data_prefix_norm  = cuvs::bench::detail::normalize_prefix(data_prefix, "data");
@@ -405,7 +546,7 @@ int main(int argc, char** argv)
 
     // Current library instantiation guarantees float support.
     if (dtype == dataset_dtype::kFloat32) {
-      return run_build_pipeline<float>(
+      return run_workload<float>(
         dataset_conf, conf_path, data_prefix_norm, index_prefix_norm, recall_at_k, skip_build);
     }
 

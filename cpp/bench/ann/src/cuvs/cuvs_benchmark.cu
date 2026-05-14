@@ -59,6 +59,7 @@ void add_merge_mode(cuvs::neighbors::sharded_merge_mode* merge_mode, const nlohm
 template <typename T>
 auto create_algo(const std::string& algo_name,
                  const std::string& distance,
+                 int rows,
                  int dim,
                  const nlohmann::json& conf) -> std::unique_ptr<cuvs::bench::algo<T>>
 {
@@ -96,7 +97,7 @@ auto create_algo(const std::string& algo_name,
   if (algo_name == "raft_cagra" || algo_name == "cuvs_cagra") {
     typename cuvs::bench::cuvs_cagra<T, uint32_t>::build_param param;
     parse_build_param<T, uint32_t>(conf, param);
-    a = std::make_unique<cuvs::bench::cuvs_cagra<T, uint32_t>>(metric, dim, param);
+    a = std::make_unique<cuvs::bench::cuvs_cagra<T, uint32_t>>(metric, rows, dim, param);
   }
 #endif
 #ifdef CUVS_ANN_BENCH_USE_CUVS_MG
@@ -129,6 +130,15 @@ auto create_algo(const std::string& algo_name,
   if (!a) { throw std::runtime_error("invalid algo: '" + algo_name + "'"); }
 
   return a;
+}
+
+template <typename T>
+auto create_algo(const std::string& algo_name,
+                 const std::string& distance,
+                 int dim,
+                 const nlohmann::json& conf) -> std::unique_ptr<cuvs::bench::algo<T>>
+{
+  return create_algo<T>(algo_name, distance, 0, dim, conf);
 }
 
 template <typename T>
@@ -204,9 +214,49 @@ REGISTER_ALGO_INSTANCE(half);
 REGISTER_ALGO_INSTANCE(std::int8_t);
 REGISTER_ALGO_INSTANCE(std::uint8_t);
 
+extern "C" auto cuvs_bench_create_algo_with_rows_float(const std::string& algo_name,
+                                                        const std::string& distance,
+                                                        int rows,
+                                                        int dim,
+                                                        const nlohmann::json& conf)
+  -> std::unique_ptr<cuvs::bench::algo<float>>
+{
+  return cuvs::bench::create_algo<float>(algo_name, distance, rows, dim, conf);
+}
+
+extern "C" auto cuvs_bench_create_algo_with_rows_half(const std::string& algo_name,
+                                                       const std::string& distance,
+                                                       int rows,
+                                                       int dim,
+                                                       const nlohmann::json& conf)
+  -> std::unique_ptr<cuvs::bench::algo<half>>
+{
+  return cuvs::bench::create_algo<half>(algo_name, distance, rows, dim, conf);
+}
+
+extern "C" auto cuvs_bench_create_algo_with_rows_int8(const std::string& algo_name,
+                                                       const std::string& distance,
+                                                       int rows,
+                                                       int dim,
+                                                       const nlohmann::json& conf)
+  -> std::unique_ptr<cuvs::bench::algo<std::int8_t>>
+{
+  return cuvs::bench::create_algo<std::int8_t>(algo_name, distance, rows, dim, conf);
+}
+
+extern "C" auto cuvs_bench_create_algo_with_rows_uint8(const std::string& algo_name,
+                                                        const std::string& distance,
+                                                        int rows,
+                                                        int dim,
+                                                        const nlohmann::json& conf)
+  -> std::unique_ptr<cuvs::bench::algo<std::uint8_t>>
+{
+  return cuvs::bench::create_algo<std::uint8_t>(algo_name, distance, rows, dim, conf);
+}
+
 #ifdef ANN_BENCH_BUILD_MAIN
 #include "../common/benchmark.hpp"
 int main(int argc, char** argv) { 
-//raft::default_logger().set_level( rapids_logger::level_enum::debug);
+raft::default_logger().set_level( rapids_logger::level_enum::trace);
 return cuvs::bench::run_main(argc, argv); }
 #endif

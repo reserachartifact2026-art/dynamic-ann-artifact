@@ -48,7 +48,6 @@ inline auto file_exists(const std::string& filename) -> bool
 
 
 struct FreshBANGConfig {
-  std::string conf_path;
   std::string data_prefix{"data/"};
   std::string index_prefix{"index/"};
 };
@@ -72,9 +71,7 @@ auto read_freshbang_config(const std::string& config_path) -> FreshBANGConfig
     auto key   = trim_whitespace(trimmed_line.substr(0, separator_pos));
     auto value = trim_whitespace(trimmed_line.substr(separator_pos + 1));
 
-    if (key == "json_conf_path") {
-      config.conf_path = value;
-    } else if (key == "data_prefix") {
+    if (key == "data_prefix") {
       config.data_prefix = value;
     } else if (key == "index_prefix") {
       config.index_prefix = value;
@@ -191,14 +188,13 @@ class FreshBANGInner {
   const std::string& index_file() const { return index_file_; }
   const std::string& algo_name() const { return algo_name_; }
   int dim() const { return dim_; }
+  const std::string& conf_path() const { return conf_path_; }
+  const std::string& data_prefix() const { return data_prefix_; }
+  const std::string& index_prefix() const { return index_prefix_; }
+
+  void set_conf_path(std::string conf_path) { conf_path_ = std::move(conf_path); }
 
   void set_algo_property(cuvs::bench::algo_property prop) { algo_property_ = prop; }
-  const cuvs::bench::algo_property& algo_property() const { return algo_property_; }
-
-  void set_search_dataset(std::shared_ptr<const cuvs::bench::dataset<T>> ds)
-  {
-    search_dataset_ = std::move(ds);
-  }
 
   void set_prefer_insert_dataset_for_search(bool value) { prefer_insert_dataset_for_search_ = value; }
   bool prefer_insert_dataset_for_search() const { return prefer_insert_dataset_for_search_; }
@@ -215,7 +211,6 @@ class FreshBANGInner {
   std::string algo_name_;
   int dim_{0};
   cuvs::bench::algo_property algo_property_{};
-  std::shared_ptr<const cuvs::bench::dataset<T>> search_dataset_;
   bool prefer_insert_dataset_for_search_{false};
   bool has_live_index_{false};
 };
@@ -255,20 +250,24 @@ bool FreshBANG<T>::SetDatasetParams(BuildParams params)
 }
 
 template <typename T>
-bool FreshBANG<T>::CreateAlgo()
+bool FreshBANG<T>::CreateAlgo(const std::string& conf_path)
 {
   std::lock_guard<std::recursive_mutex> api_lock(cuvs::bench::get_bench_api_mutex());
 
   std::cout << "[FreshBANG::CreateAlgo] called" << std::endl;
+  if (conf_path.empty()) {
+    std::cerr << "[FreshBANG::CreateAlgo] Error: conf_path must be non-empty." << std::endl;
+    return false;
+  }
 
-  constexpr auto config_path = "freshbang.conf";
+  constexpr auto config_path = "freshbang.cfg";
   auto config                = cuvs::bench::detail::read_freshbang_config(config_path);
 
   const auto data_prefix_norm  = cuvs::bench::detail::normalize_prefix(config.data_prefix, "data/");
   const auto index_prefix_norm = cuvs::bench::detail::normalize_prefix(config.index_prefix, "index/");
 
-  std::ifstream conf_stream(config.conf_path);
-  cuvs::bench::ensure_stream_open(conf_stream, config.conf_path);
+  std::ifstream conf_stream(conf_path);
+  cuvs::bench::ensure_stream_open(conf_stream, conf_path);
 
   auto& conf                  =
     cuvs::bench::configuration::initialize(conf_stream, data_prefix_norm, index_prefix_norm);
@@ -280,9 +279,10 @@ bool FreshBANG<T>::CreateAlgo()
 
   if (m_pImpl == nullptr) {
     m_pImpl =
-      new cuvs::bench::detail::FreshBANGInner<T>(config.conf_path, data_prefix_norm, index_prefix_norm);
+      new cuvs::bench::detail::FreshBANGInner<T>(conf_path, data_prefix_norm, index_prefix_norm);
   }
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  impl->set_conf_path(conf_path);
 
   std::cout << "[FreshBANG::CreateAlgo] Calling invoke_create_algo for algo='" << index.algo
             << "' distance='" << user_build_params_.distance_measure << "' rows="
@@ -370,10 +370,12 @@ bool FreshBANG<T>::BuildIndex(const T* base_vectors, uint32_t num_basevectors)
     std::cout << "[FreshBANG::BuildIndex] Ensured directory exists: " << index_path.parent_path()
               << std::endl;
   }
-  std::cout << "[FreshBANG::BuildIndex] Calling save('" << impl->index_file() << "')" << std::endl;
-  algo_obj->save(impl->index_file());
+
+    std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
+  //algo_obj->save(impl->index_file());
+  algo_obj->save("/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before");
   std::cout << "[FreshBANG::BuildIndex] save() completed" << std::endl;
-  impl->set_has_live_index(true);
+  impl->set_has_live_index(true); 
 
   return true;
 }
@@ -415,18 +417,11 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
     return false;
   }
 
-  constexpr auto config_path = "freshbang.conf";
-  auto config                = cuvs::bench::detail::read_freshbang_config(config_path);
-  const auto data_prefix_norm =
-    cuvs::bench::detail::normalize_prefix(config.data_prefix, "data/");
-  const auto index_prefix_norm =
-    cuvs::bench::detail::normalize_prefix(config.index_prefix, "index/");
-
-  std::ifstream conf_stream(config.conf_path);
-  cuvs::bench::ensure_stream_open(conf_stream, config.conf_path);
+  std::ifstream conf_stream(impl->conf_path());
+  cuvs::bench::ensure_stream_open(conf_stream, impl->conf_path());
 
   auto& conf =
-    cuvs::bench::configuration::initialize(conf_stream, data_prefix_norm, index_prefix_norm);
+    cuvs::bench::configuration::initialize(conf_stream, impl->data_prefix(), impl->index_prefix());
   const std::string index_name = "";
   const std::size_t index_pos  = 0;
   const auto& index            = cuvs::bench::detail::pick_index(conf, index_name, index_pos);
@@ -454,10 +449,11 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
   // ToDo: Is it really required? 
   // Store dataset (lifetime) and algo_property (for query staging in BatchedSearch)
   impl->set_algo_property(algo_property);
-   //impl->set_search_dataset(dataset_for_search);
+   
+  
 
   // We need to explicitly set the dataset, the previous build step wouldn't set it for us
-  if (search_param->needs_dataset()) { // returns true for Cagra
+  if (search_param->needs_dataset()) { // returns always true for Cagra
     if (impl->prefer_insert_dataset_for_search() && dataset_for_search->has_insert_set()) {
       algo_obj->set_search_dataset(dataset_for_search->insert_set(algo_property.dataset_memory_type),
                                    dataset_for_search->insert_set_size());
@@ -468,10 +464,17 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
                                    dataset_for_search->base_set_size());
     }
   }
+ 
 
   algo_obj->set_search_param(*search_param,
                              dataset_for_search->filter_bitset(algo_property.dataset_memory_type));
   user_search_params_ = params;
+ 
+    std::cout << "[FreshBANG::BuildIndex] Calling save('" << impl->index_file() << "')" << std::endl;
+  algo_obj->save(impl->index_file());
+  std::cout << "[FreshBANG::BuildIndex] save() completed" << std::endl;
+  impl->set_has_live_index(true); 
+
   return true;
 }
 
@@ -607,15 +610,13 @@ bool FreshBANG<T>::SetInsertParams()
     return false;
   }
 
-  constexpr auto config_path = "freshbang.conf";
-  auto config                = cuvs::bench::detail::read_freshbang_config(config_path);
   const std::size_t index_pos = 0;
 
   nlohmann::json insert_params_json = nlohmann::json::object();
   try {
-    std::ifstream conf_json_stream(config.conf_path);
+    std::ifstream conf_json_stream(impl->conf_path());
     if (!conf_json_stream) {
-      throw std::runtime_error("Cannot open configuration file: " + config.conf_path);
+      throw std::runtime_error("Cannot open configuration file: " + impl->conf_path());
     }
 
     auto conf_json = nlohmann::json::parse(conf_json_stream);
@@ -634,7 +635,7 @@ bool FreshBANG<T>::SetInsertParams()
     }
   } catch (const std::exception& e) {
     std::cerr << "[FreshBANG::SetInsertParams] Warning: failed to parse insert params from "
-              << config.conf_path << ": " << e.what() << std::endl;
+              << impl->conf_path() << ": " << e.what() << std::endl;
     std::cerr << "[FreshBANG::SetInsertParams] Using default insert params" << std::endl;
     insert_params_json = nlohmann::json::object();
   }

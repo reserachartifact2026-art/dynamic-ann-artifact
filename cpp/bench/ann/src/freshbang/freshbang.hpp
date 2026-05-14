@@ -37,11 +37,11 @@ public:
 
     FreshBANG();
     
-    // <--- Initialization Sequence of Operations ---> 
+    // <--- (1) Initialization Sequence of Operations ---> 
     // called only ONCE in the beginning, not before every build/createAlgo
     bool SetDatasetParams(BuildParams params);
 
-    bool CreateAlgo();
+    bool CreateAlgo(const std::string& conf_path);
 
     bool BuildIndex(const T* base_vectors, uint32_t num_base_vectors);
 
@@ -51,13 +51,15 @@ public:
     // called only ONCE in the beginning, not before every insert
     bool SetInsertParams();
 
-    // <--- Dynamic Operations ---> 
+    // <--- (2)  Dynamic Operations ---> 
     // Pre-req: For all the search/insert/delete APIs, ensure ALL the SetXParams are done before calling them
    
     // Note: Only ONE batched operation can be performed at a time. 
     // Concurrent operations (e.g., search and insert at the same time) are not supported in this version.
 
-    // Note on IDs: These are actually slots IDs. Always in range 0 - N-1 and re-used across deletes and inserts. 
+    // Important note on IDs: These are semantically slot or row numbers and not running numbers. 
+    // Therefore, they are in the range 0 - N-1 where N = BuildParams.dataset_rows. 
+    // These are re-used across deletes and inserts. 
 
     void BatchedSearch(const T* searchvectors, 
                         uint32_t batch_size,
