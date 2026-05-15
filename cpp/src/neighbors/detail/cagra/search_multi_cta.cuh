@@ -236,6 +236,7 @@ struct search
                    hashmap.data(),
                    num_cta_per_query,
                    num_seeds,
+                   this->deleted_rows_ptr,
                    sample_filter,
                    stream);
     RAFT_CUDA_TRY(cudaPeekAtLastError());

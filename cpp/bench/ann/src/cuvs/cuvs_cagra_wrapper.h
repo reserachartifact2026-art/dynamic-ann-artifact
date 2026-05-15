@@ -109,19 +109,22 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
         std::move(raft::make_device_matrix<IdxT, int64_t>(handle_, 0, 0)))),
       input_dataset_v_(
         std::make_shared<raft::device_matrix_view<const T, int64_t, raft::row_major>>(
-          nullptr, 0, 0))
+          nullptr, 0, 0)),
+      rows_(rows)    
   {
     auto initial_rows = rows > 0 ? static_cast<size_t>(rows) : size_t{0};
     d_deleted_rows_   = std::make_shared<rmm::device_buffer>(
       initial_rows * sizeof(uint8_t), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
     RAFT_CUDA_TRY(cudaMemsetAsync(
-      d_deleted_rows_->data(), 0, initial_rows * sizeof(uint8_t), handle_.get_sync_stream()));
+      d_deleted_rows_->data(), 1, initial_rows * sizeof(uint8_t), handle_.get_sync_stream()));
+      //sync after memset to ensure deleted rows are marked before any search/build operation
+    handle_.get_sync_stream().synchronize();
+
   }
 
   cuvs_cagra(Metric metric, int dim, const build_param& param, int concurrent_searches = 1)
     : cuvs_cagra(metric, 0, dim, param, concurrent_searches)
   {
-    
   }
 
   void build(const T* dataset, size_t nrow) final;
@@ -223,6 +226,8 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   // START: For delete experiments
   std::shared_ptr<rmm::device_buffer> d_deleted_rows_;
   // END: For delete experiments
+  // Max rows the dataset can expand upto
+  int rows_;
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {
@@ -239,6 +244,7 @@ void cuvs_cagra<T, IdxT>::build(const T* dataset, size_t nrow)
 {
   auto dataset_extents = raft::make_extents<IdxT>(nrow, dim_);
   auto params          = index_params_.cagra_params(dataset_extents, parse_metric_type(metric_));
+  std::cout << "[cuvs_cagra::build] Building index with nrow=" << nrow << std::endl;
 
   auto dataset_view_host =
     raft::make_mdspan<const T, IdxT, raft::row_major, true, false>(dataset, dataset_extents);
@@ -292,6 +298,18 @@ void cuvs_cagra<T, IdxT>::build(const T* dataset, size_t nrow)
         std::move(cuvs::neighbors::cagra::merge(handle_, params, indices)));
     }
   }
+
+  // ToDo Optimiz this
+  auto not_deleted_rows_bytes = static_cast<size_t>(nrow) * sizeof(uint8_t);
+  d_deleted_rows_         = std::make_shared<rmm::device_buffer>(
+    not_deleted_rows_bytes, handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
+  if (not_deleted_rows_bytes > 0) {
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      d_deleted_rows_->data(), 0, not_deleted_rows_bytes, handle_.get_sync_stream()));
+    raft::resource::sync_stream(handle_);
+  }
+
+  
  
 }
 
@@ -350,6 +368,11 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
   dynamic_batching_conservative_dispatch_ = sp.dynamic_batching_conservative_dispatch;
   search_params_                          = sp.p;
   refine_ratio_                           = sp.refine_ratio;
+  search_params_.deleted_rows_ptr =
+    d_deleted_rows_ ? static_cast<const uint8_t*>(d_deleted_rows_->data()) : nullptr;
+    
+  // Enable cuvs logging for debugging
+  raft::default_logger().set_level( rapids_logger::level_enum::debug);
   if (sp.graph_mem != graph_mem_) {
     // Move graph to correct memory space
     graph_mem_ = sp.graph_mem;
@@ -415,6 +438,11 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
   } else {
     if (dynamic_batcher_) { dynamic_batcher_.reset(); }
   }
+  // print graph and dataset extents for debugging
+  auto graph = index_->graph();
+  auto dataset = index_->dataset();
+  std::cout << "[cuvs_cagra::set_search_param] graph extents: (" << graph.extent(0) << ", " << graph.extent(1) << ")" << std::endl;
+  std::cout << "[cuvs_cagra::set_search_param] dataset extents: (" << dataset.extent(0) << ", " << dataset.extent(1) << ")" << std::endl; 
 }
 
 template <typename T, typename IdxT>
@@ -424,6 +452,16 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
   // Keep the internally expanded dataset instead if the provided one is smaller.
   if (has_inserted_data_ && index_ && nrow < static_cast<size_t>(index_->graph().extent(0))) {
     return;
+  }
+
+  auto stream              = raft::resource::get_cuda_stream(handle_);
+  const auto expected_rows = rows_ > 0 ? static_cast<size_t>(rows_) : size_t{0};
+  if (expected_rows != 0 && nrow != expected_rows) { // relaxed the check when running as EXE (CUVS_CAGRA_ANN_BENCH , legacy flow)
+    
+    throw std::runtime_error(
+      "set_search_dataset: search dataset row count (" + std::to_string(nrow) +
+      ") does not match initial dataset row count used during algo creation (" +
+      std::to_string(expected_rows) + ").");
   }
 
   if (index_params_.num_dataset_splits > 1 &&
@@ -459,9 +497,78 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
     // the dataset set. Check if we need update.
     if (static_cast<size_t>(input_dataset_v_->extent(0)) != nrow ||
         input_dataset_v_->data_handle() != dataset) {
-      *input_dataset_v_ =
-        raft::make_device_matrix_view<const T, int64_t>(dataset, nrow, this->dim_);
-      need_dataset_update_ = !is_vpq;  // ignore update if this is a VPQ dataset.
+      bool dataset_is_on_host = raft::get_device_for_address(dataset) == -1;
+      if (dataset_is_on_host) {
+        auto host_dataset_view =
+          raft::make_host_matrix_view<const T, int64_t, raft::row_major>(dataset, nrow, this->dim_);
+        auto dataset_mr = get_mr(dataset_mem_);
+        cuvs::neighbors::cagra::detail::copy_with_padding(
+          handle_, *dataset_, host_dataset_view, dataset_mr);
+        auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
+          dataset_->data_handle(), this->rows_, this->dim_, dataset_->extent(1));
+        index_->update_dataset(handle_, dataset_view);
+
+        *input_dataset_v_ =
+          raft::make_device_matrix_view<const T, int64_t>(dataset_->data_handle(), this->rows_, this->dim_);
+ 
+        need_dataset_update_ = false;
+      } else {
+        // Question: should dataset_ and index_->update_dataset() also be updated in this case? 
+        *input_dataset_v_ =
+          raft::make_device_matrix_view<const T, int64_t>(dataset, nrow, this->dim_);
+        need_dataset_update_ = !is_vpq;  // ignore update if this is a VPQ dataset.
+      }
+    }
+  }
+
+  // If we are attaching to a bigger dataset than the current graph size,
+  // expand graph_ by replicating the last valid row.
+  auto old_graph   = index_->graph();
+  auto old_rows    = old_graph.extent(0);
+  auto cols        = old_graph.extent(1);
+  auto target_rows = static_cast<int64_t>(nrow);
+  std::cout << "[cuvs_cagra::set_search_dataset] expanding old graph, old_rows=" << old_rows
+            << ", target_rows=" << target_rows << std::endl;
+  if (old_rows < target_rows) {
+    auto mr                 = get_mr(graph_mem_);
+    auto stream             = raft::resource::get_cuda_stream(handle_);
+    auto new_expanded_graph = raft::make_device_mdarray<IdxT, int64_t>(
+      handle_, mr, raft::make_extents<int64_t>(target_rows, cols));
+
+    if (old_rows > 0) {
+      raft::copy(
+        new_expanded_graph.data_handle(), old_graph.data_handle(), old_graph.size(), stream);
+      raft::resource::sync_stream(handle_);
+
+    }
+
+    *graph_ = std::move(new_expanded_graph);
+    index_->update_graph(handle_, make_const_mdspan(graph_->view()));
+
+    // Also expand deleted_rows buffer and mark expanded rows as deleted
+    if (d_deleted_rows_) {
+      auto old_deleted_bytes = static_cast<size_t>(old_rows) * sizeof(uint8_t);
+      auto new_deleted_bytes = static_cast<size_t>(target_rows) * sizeof(uint8_t);
+      auto new_deleted_rows  = std::make_shared<rmm::device_buffer>(
+        new_deleted_bytes, stream, get_mr(AllocatorType::kDevice));
+
+      // Copy old (built) rows as not deleted (0)
+      if (old_rows > 0 && old_deleted_bytes > 0) {
+        RAFT_CUDA_TRY(cudaMemcpyAsync(
+          new_deleted_rows->data(), d_deleted_rows_->data(), old_deleted_bytes, 
+          cudaMemcpyDeviceToDevice, stream));
+      }
+
+      // Mark expanded rows (old_rows to target_rows) as deleted (1)
+      auto new_deleted_ptr = static_cast<uint8_t*>(new_deleted_rows->data());
+      auto expanded_bytes  = static_cast<size_t>(target_rows - old_rows) * sizeof(uint8_t);
+      if (expanded_bytes > 0) {
+        RAFT_CUDA_TRY(cudaMemsetAsync(
+          new_deleted_ptr + old_rows, 1, expanded_bytes, stream));
+      }
+      raft::resource::sync_stream(handle_);
+
+      d_deleted_rows_ = new_deleted_rows;
     }
   }
 }
@@ -515,6 +622,18 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
     index_ = std::make_shared<cuvs::neighbors::cagra::index<T, IdxT>>(handle_);
     cuvs::neighbors::cagra::deserialize(handle_, file, index_.get());
   }
+  rows_ = index_->graph().extent(0);
+  auto deleted_rows_bytes = static_cast<size_t>(rows_) * sizeof(uint8_t);
+  d_deleted_rows_         = std::make_shared<rmm::device_buffer>(
+    deleted_rows_bytes, handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
+  if (deleted_rows_bytes > 0) {
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      d_deleted_rows_->data(), 1, deleted_rows_bytes, handle_.get_sync_stream()));
+    // ToDo: Current hardcoded 1000
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      d_deleted_rows_->data(), 0, 1000, handle_.get_sync_stream()));
+    raft::resource::sync_stream(handle_);
+  }
 }
 
 template <typename T, typename IdxT>
@@ -539,6 +658,7 @@ void cuvs_cagra<T, IdxT>::set_insert_param_from_json(const nlohmann::json& conf)
   }
   set_insert_param(ip);
 }
+
 #if 0
 // serialized insert
 template <typename T, typename IdxT>
@@ -794,7 +914,7 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
 
 #else
 template <typename T, typename IdxT>  
-void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uint64_t* ids)
+void cuvs_cagra<T, IdxT>::insert_wait(const T* vectors, size_t num_vectors, const uint64_t* ids)
 {
   (void)ids;
   if (num_vectors == 0) { return; }
@@ -930,9 +1050,9 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
 // ...existing code...
 #endif
 
-
+// My multi-threaded implementation
 template <typename T, typename IdxT>  
-void cuvs_cagra<T, IdxT>::insert_wait(const T* vectors, size_t num_vectors, const uint64_t* ids)
+void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uint64_t* ids)
 {
   (void)ids;
   if (num_vectors == 0) { return; }
@@ -1109,6 +1229,10 @@ void cuvs_cagra<T, IdxT>::insert_wait(const T* vectors, size_t num_vectors, cons
                 static_cast<size_t>(dim) * sizeof(T));
 
     int64_t new_row_id = old_rows + row;
+    // Set this row as not deleted
+    RAFT_CUDA_TRY(cudaMemsetAsync(
+      (uint8_t*)d_deleted_rows_->data()+new_row_id, 0, 1, handle_.get_sync_stream()));
+    
     std::vector<IdxT> adjacency;
     adjacency.reserve(static_cast<size_t>(cols));
 
@@ -1118,6 +1242,21 @@ void cuvs_cagra<T, IdxT>::insert_wait(const T* vectors, size_t num_vectors, cons
                                                   static_cast<size_t>(j)]);
       auto nid_i64 = static_cast<int64_t>(nid);
       if (nid_i64 < 0 || nid_i64 >= old_rows) { continue; }
+      // copy d_deleted_rows_ to host and check if the neighbor is marked as deleted
+      uint8_t deleted_flag;
+      RAFT_CUDA_TRY(cudaMemcpyAsync(&deleted_flag,
+                                     (uint8_t*)d_deleted_rows_->data() + nid,
+                                     1,
+                                     cudaMemcpyDeviceToHost,
+                                     handle_.get_sync_stream()));
+      RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_sync_stream()));
+      if (deleted_flag  == 1)
+      {
+        // log an error message here, as this should not happen ideally.
+        std::cerr << "[cuvs_cagra_wrapper] Encountered deleted neighbor: " << nid << " for row: "
+        << new_row_id << std::endl;
+        continue;  // skip deleted neighbor
+      }
       bool exists = std::find(adjacency.begin(), adjacency.end(), nid) != adjacency.end();
       if (!exists) { adjacency.push_back(nid); }
     }
@@ -1498,6 +1637,7 @@ template <typename T, typename IdxT>
 void cuvs_cagra<T, IdxT>::search(
   const T* queries, int batch_size, int k, algo_base::index_type* neighbors, float* distances) const
 {
+
   search_ex(queries, batch_size, k, neighbors, distances, nullptr);
 }
 
@@ -1516,12 +1656,46 @@ void cuvs_cagra<T, IdxT>::search_ex(
   if (neighbors == nullptr || distances == nullptr) {
     throw std::runtime_error("search_ex requires non-null neighbors and distances pointers");
   }
+    // scan the adjacency list of graph and validate all enighbours are < 1000 for debugging
+  auto graph_view = index_->graph();
+  auto graph_rows = graph_view.extent(0);
+  auto graph_cols = graph_view.extent(1);
+  // copy graph to host for validation
+  std::vector<IdxT> graph_host(static_cast<size_t>(graph_rows * graph_cols), IdxT{0});
+  raft::copy(graph_host.data(), graph_view.data_handle(), graph_rows * graph_cols, raft::resource::get_cuda_stream(handle_));
+   raft::resource::sync_stream(handle_);
+  // print graph dimensions for debugging
+  std::cout << "[search] graph dimensions: rows=" << graph_rows << " cols=" << graph_cols << std::endl;     
+  
+  for (int64_t r = 0; r < graph_rows; ++r)  {
+      for (int64_t c = 0; c < graph_cols; ++c) {
+          auto neighbor_id = graph_host[r * graph_cols + c];
+          if (neighbor_id >= 1000) {
+              //std::cerr << "Invalid neighbor id " << neighbor_id << " at graph[" << r << "][" << c << "]" << std::endl;
+              //throw std::runtime_error("Invalid neighbor id found in graph");
+          }
+      }
+  } 
 
   auto k0                       = static_cast<size_t>(refine_ratio_ * k);
   const bool disable_refinement = k0 <= static_cast<size_t>(k);
   const raft::resources& res    = handle_;
   const auto stream             = raft::resource::get_cuda_stream(res);
   const auto n_elems = static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(k);
+  const auto n_query_elems = static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(dim_);
+
+  if (queries == nullptr && batch_size > 0) {
+    throw std::runtime_error("search_ex requires a non-null queries pointer when batch_size > 0");
+  }
+
+  auto queries_on_device = raft::get_device_for_address(queries) >= 0;
+  rmm::device_uvector<T> queries_dev_staging(0, stream);
+  const T* search_queries = queries;
+  if (!queries_on_device) {
+    queries_dev_staging.resize(n_query_elems, stream);
+    raft::copy(queries_dev_staging.data(), queries, n_query_elems, stream);
+    search_queries = queries_dev_staging.data();
+  }
 
   auto neighbors_on_device = raft::get_device_for_address(neighbors) >= 0;
   auto distances_on_device = raft::get_device_for_address(distances) >= 0;
@@ -1535,6 +1709,7 @@ void cuvs_cagra<T, IdxT>::search_ex(
   auto* search_distances = distances;
 
   if (!neighbors_on_device) {
+    // allocate staging buffers on device if output buffers are on host, to avoid cudaMemcpyDeviceToHost in refinement step
     neighbors_dev_staging.resize(n_elems, stream);
     distances_dev_staging.resize(n_elems, stream);
     search_neighbors = neighbors_dev_staging.data();
@@ -1545,11 +1720,14 @@ void cuvs_cagra<T, IdxT>::search_ex(
                          ? MemoryType::kDevice
                          : MemoryType::kHostPinned;
 
-  // NOTE: caching mem_type to reduce mutex locks
-  // raft::get_device_for_address call cuda API to get the pointer properties,
+  // NOTE: caching mem_type to reduce mutex locks 
+  // raft::get_device_for_address call cuda API to get the pointer properties, (But, still we are calling get_dev_for_addr everytime)
   // this means it locks the context mutex for a very small amount of time.
   // In the event of thread contention (such as thousands threads), this time can actually increase.
   // Hence we try to bypass this check for repeated search calls.
+
+  // If the same output pointer is reused across calls, its memory location (host/device) should not change, 
+  // so they reuse cached mem_type instead of re-deriving it.
   thread_local MemoryType mem_type                   = MemoryType::kDevice;
   thread_local algo_base::index_type* prev_neighbors = nullptr;
   if (prev_neighbors != search_neighbors) {
@@ -1576,9 +1754,9 @@ void cuvs_cagra<T, IdxT>::search_ex(
     reinterpret_cast<float*>(candidates_ptr + (disable_refinement ? 0 : batch_size * k0));
 
   if (disable_refinement) {
-    search_base(queries, batch_size, k, search_neighbors, search_distances);
+    search_base(search_queries, batch_size, k, search_neighbors, search_distances);
   } else {
-    search_base(queries, batch_size, k0, candidates_ptr, candidate_dists_ptr);
+    search_base(search_queries, batch_size, k0, candidates_ptr, candidate_dists_ptr);
 
     if (mem_type == MemoryType::kHostPinned && uses_stream()) {
       // If the algorithm uses a stream to synchronize (non-persistent kernel), but the data is in
@@ -1591,7 +1769,8 @@ void cuvs_cagra<T, IdxT>::search_ex(
       raft::make_device_matrix_view<const algo_base::index_type, algo_base::index_type>(
         candidates_ptr, batch_size, k0);
     auto queries_v =
-      raft::make_device_matrix_view<const T, algo_base::index_type>(queries, batch_size, dim_);
+      raft::make_device_matrix_view<const T, algo_base::index_type>(
+        search_queries, batch_size, dim_);
     refine_helper(
       res,
       *input_dataset_v_,
@@ -1603,47 +1782,85 @@ void cuvs_cagra<T, IdxT>::search_ex(
       index_->metric());
   }
 
+  // only if neighbors and distances are on host, we copy back the results from device to host. 
+  // If they are already on device, we can directly use them without copy.
   if (!neighbors_on_device) {
     raft::copy(neighbors, search_neighbors, n_elems, stream);
     raft::copy(distances, search_distances, n_elems, stream);
     raft::resource::sync_stream(res);
   }
-
+  // ids is expected to be on host, so we always copy back the neighbor indices if ids is not nullptr, regardless of where neighbors are.
   if (ids != nullptr) {
     if (neighbors_on_device) {
-      std::vector<algo_base::index_type> host_neighbors(n_elems);
-      raft::copy(host_neighbors.data(),
-                 search_neighbors,
-                 n_elems,
-                 stream);
-      raft::resource::sync_stream(res);
-      for (std::size_t idx = 0; idx < n_elems; ++idx) {
-        ids[idx] = static_cast<int64_t>(host_neighbors[idx]);
+      if constexpr (std::is_same_v<algo_base::index_type, int64_t>) {
+        raft::copy(ids, search_neighbors, n_elems, stream);
+        raft::resource::sync_stream(res);
+      } else {
+        std::vector<algo_base::index_type> host_neighbors(n_elems);
+        raft::copy(host_neighbors.data(), search_neighbors, n_elems, stream);
+        raft::resource::sync_stream(res);
+        for (std::size_t idx = 0; idx < n_elems; ++idx) {
+          ids[idx] = static_cast<int64_t>(host_neighbors[idx]);
+        }
       }
     } else {
-      for (std::size_t idx = 0; idx < n_elems; ++idx) {
-        ids[idx] = static_cast<int64_t>(neighbors[idx]);
+      if constexpr (std::is_same_v<algo_base::index_type, int64_t>) {
+        std::memcpy(ids, neighbors, n_elems * sizeof(algo_base::index_type));
+      } else {
+        for (std::size_t idx = 0; idx < n_elems; ++idx) {
+          ids[idx] = static_cast<int64_t>(neighbors[idx]);
+        }
       }
     }
   }
-  // print first five neighbours and distances of first query for debugging
+  // print first k neighbours and distances of first and second query for debugging
   {
-    std::vector<algo_base::index_type> host_neighbors(std::min<std::size_t>(5, n_elems));
-    std::vector<float> host_distances(std::min<std::size_t>(5, n_elems));
-    raft::copy(host_neighbors.data(),
-               search_neighbors,
-               host_neighbors.size(),
-               stream);
-    raft::copy(host_distances.data(),
-               search_distances,
-               host_distances.size(),
-               stream);
-    raft::resource::sync_stream(res);
-    std::cout << "[search_ex] first query neighbors: ";
-    for (size_t i = 0; i < host_neighbors.size(); ++i) {
-      std::cout << host_neighbors[i] << "(" << host_distances[i] << ") ";
+    constexpr std::size_t kDebugTopN = 10;
+    auto debug_count                 = std::min<std::size_t>(kDebugTopN, static_cast<std::size_t>(k));
+    if (batch_size > 0) {
+      if (neighbors_on_device) {
+        // Allocate for first and second query results
+        std::size_t copy_count = std::min<std::size_t>(debug_count * 2, n_elems);
+        std::vector<algo_base::index_type> host_neighbors(copy_count);
+        std::vector<float> host_distances(copy_count);
+        raft::copy(host_neighbors.data(), search_neighbors, copy_count, stream);
+        raft::copy(host_distances.data(), search_distances, copy_count, stream);
+        raft::resource::sync_stream(res);
+        
+        // Print first query
+        std::cout << "[search_ex] query 0 neighbors: ";
+        for (size_t i = 0; i < debug_count; ++i) {
+          std::cout << host_neighbors[i] << "(" << host_distances[i] << ") ";
+        }
+        std::cout << std::endl;
+        
+        // Print second query if available
+        if (batch_size > 1) {
+          std::cout << "[search_ex] query 1 neighbors: ";
+          for (size_t i = 0; i < debug_count && (debug_count + i) < copy_count; ++i) {
+            std::cout << host_neighbors[debug_count + i] << "(" << host_distances[debug_count + i] << ") ";
+          }
+          std::cout << std::endl;
+        }
+      } else {
+        // Print first query
+        std::cout << "[search_ex] query 0 neighbors: ";
+        for (size_t i = 0; i < debug_count; ++i) {
+          std::cout << neighbors[i] << "(" << distances[i] << ") ";
+        }
+        std::cout << std::endl;
+        
+        // Print second query if available
+        if (batch_size > 1) {
+          std::cout << "[search_ex] query 1 neighbors: ";
+          for (size_t i = 0; i < debug_count; ++i) {
+            std::cout << neighbors[static_cast<size_t>(k) + i] << "(" 
+                      << distances[static_cast<size_t>(k) + i] << ") ";
+          }
+          std::cout << std::endl;
+        }
+      }
     }
-    std::cout << std::endl;
   }
 }
 }  // namespace cuvs::bench

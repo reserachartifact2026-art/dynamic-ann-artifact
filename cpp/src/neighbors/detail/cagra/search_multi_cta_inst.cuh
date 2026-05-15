@@ -26,11 +26,12 @@ namespace cuvs::neighbors::cagra::detail::multi_cta_search {
     uint32_t block_size,                                                           \
     uint32_t result_buffer_size,                                                   \
     uint32_t smem_size,                                                            \
-    uint32_t small_hash_bitlen,                                                    \
-    int64_t hash_bitlen,                                                           \
-    uint32_t* hashmap_ptr,                                                         \
+    uint32_t visited_hash_bitlen,                                                  \
+    int64_t traversed_hash_bitlen,                                                 \
+    uint32_t* traversed_hashmap_ptr,                                               \
     uint32_t num_cta_per_query,                                                    \
     uint32_t num_seeds,                                                            \
+    const uint8_t* deleted_rows_ptr,                                               \
     SampleFilterT sample_filter,                                                   \
     cudaStream_t stream);
 

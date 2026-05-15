@@ -66,12 +66,12 @@ public:
                         uint64_t* ids,
                         uint32_t* neighbors, 
                         float* distances); 
-
+    // Note: The ids need to be contigious     
     void BatchedInsert(const T* insertvectors, 
                         uint32_t batch_size,
                         const uint64_t* ids 
                         );
-
+    // Note: The ids need to be contigious                         
     void BatchedDelete(const uint64_t* ids, 
                         uint32_t batch_size);
 

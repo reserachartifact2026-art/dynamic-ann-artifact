@@ -21,7 +21,7 @@
 namespace {
 
 enum class dataset_dtype { kFloat32, kInt32, kUInt8, kInt8, kUnknown };
-#define PIPELINE_RUNS 0 // > 1, not working now
+#define PIPELINE_RUNS 1 // > 1, not working now
 
 struct DriverConfig {
   std::string data_prefix;
@@ -415,7 +415,7 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
       return 1;
     }
     std::cout << "[freshbang_driver] Post-insert search pipeline completed" << std::endl;
-
+#if 0
     if (!run_delete_phase(inserted_ids_for_delete)) {
       return 1;
     }
@@ -428,7 +428,8 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
       return 1;
     }
     std::cout << "[freshbang_driver] Post-delete search pipeline completed" << std::endl;
-  } 
+#endif
+  }
 
   // final cleanup
   //freshbang.Cleanup();

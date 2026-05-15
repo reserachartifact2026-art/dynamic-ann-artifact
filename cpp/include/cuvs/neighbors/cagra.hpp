@@ -277,6 +277,10 @@ struct search_params : cuvs::neighbors::search_params {
    * negative, in which case the filtering rate is automatically calculated.
    */
   float filtering_rate = -1.0;
+
+  /** Raw device pointer to a uint8_t array [dataset_size], where 0=active, 1=deleted.
+   *  Experimental: pass nullptr if not used. */
+  const uint8_t* deleted_rows_ptr = nullptr;
 };
 
 /**

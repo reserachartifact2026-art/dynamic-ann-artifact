@@ -101,12 +101,26 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes(
   const uint32_t visited_hash_bitlen,
   IndexT* __restrict__ traversed_hash_ptr,
   const uint32_t traversed_hash_bitlen,
+  const uint8_t* deleted_rows_ptr = nullptr,
   const uint32_t block_id   = 0,
   const uint32_t num_blocks = 1)
 {
   const auto team_size_bits = dataset_desc.team_size_bitshift_from_smem();
   const auto max_i = raft::round_up_safe<uint32_t>(num_pickup, warp_size >> team_size_bits);
   const auto compute_distance = dataset_desc.compute_distance_impl;
+/*
+  // Debug: print kernel launch/runtime parameters once per block.
+  if (threadIdx.x == 0) {
+    printf("[cagra search kernel debug] team_size_bits=%u max_i=%u num_distilation=%u "
+           "num_pickup=%u rand_xor_mask=%llu num_seeds=%u\n",
+           static_cast<unsigned>(team_size_bits),
+           static_cast<unsigned>(max_i),
+           static_cast<unsigned>(num_distilation),
+           static_cast<unsigned>(num_pickup),
+           static_cast<unsigned long long>(rand_xor_mask),
+           static_cast<unsigned>(num_seeds));
+  }
+*/
 
   for (uint32_t i = threadIdx.x >> team_size_bits; i < max_i; i += (blockDim.x >> team_size_bits)) {
     const bool valid_i = (i < num_pickup);
@@ -125,7 +139,7 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes(
           seed_index = device::xorshift64(gid ^ rand_xor_mask) % dataset_desc.size;
         }
       }
-
+      // print threadid, block ids and the seed_
       const auto norm2 = dataset_desc.compute_distance(seed_index, valid_i);
 
       if (valid_i && (norm2 < best_norm2_team_local)) {
@@ -149,8 +163,17 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes(
           best_index_team_local = raft::upper_bound<IndexT>();
         }
       }
-      result_distances_ptr[i] = best_norm2_team_local;
       result_indices_ptr[i]   = best_index_team_local;
+      // assuming result_indices_ptr[i] is in valid range
+      result_distances_ptr[i] = best_norm2_team_local;
+
+      // Deleted node filteration
+      // Invalidate deleted rows by setting distance to upper bound sentinel
+      if (deleted_rows_ptr && result_indices_ptr[i] != raft::upper_bound<IndexT>() &&
+          deleted_rows_ptr[result_indices_ptr[i]] == 1) {
+        result_distances_ptr[i] = raft::upper_bound<DistanceT>();
+        result_indices_ptr[i]   = raft::upper_bound<IndexT>();
+      }
     }
   }
 }

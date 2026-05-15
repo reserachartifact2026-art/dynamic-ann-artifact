@@ -74,6 +74,10 @@ __global__ void cuvs_bang_delete_kernel2(DeleteKernelParams params)
       if (neighbor == cur_row) {
         for (uint32_t temp_iter = 0; temp_iter < params.graph_cols; temp_iter++){
         uint32_t cur_row_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + circular_counter];
+        if (cur_row_neighbour >= static_cast<uint64_t>(params.graph_rows)) {
+          if (++circular_counter >= params.graph_cols ) circular_counter = 0;
+          continue;
+        }
         if (params.deleted_rows[cur_row_neighbour] != 1){
           // Replace the deleted-node reference with a live neighbor from the deleted row.
           params.graph[(row * static_cast<uint64_t>(params.graph_cols)) + col] = cur_row_neighbour;
@@ -93,10 +97,15 @@ __global__ void cuvs_bang_delete_kernel2(DeleteKernelParams params)
       uint32_t temp_iter = 0;
       while (temp_iter++ < params.graph_cols-1) {
         uint32_t cur_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + temp_iter];
+        if (cur_neighbour >= static_cast<uint64_t>(params.graph_rows)) { continue; }
         if (params.deleted_rows[cur_neighbour] != 1) {
           // Copy adjacency list of a live neighbor into the deleted row.
           for (int64_t col = 0; col < params.graph_cols; col++) {
             uint32_t candidate = params.graph[cur_neighbour * static_cast<uint64_t>(params.graph_cols) + col];
+            if (candidate >= static_cast<uint64_t>(params.graph_rows)) {
+              params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + col] = 1;
+              continue;
+            }
             if ((params.deleted_rows[candidate] != 1)) {
               params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col] = candidate;
             } else {

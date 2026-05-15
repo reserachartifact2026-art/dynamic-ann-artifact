@@ -171,6 +171,7 @@ RAFT_KERNEL __launch_bounds__(1024, 1) search_kernel(
   const uint32_t min_iteration,
   const uint32_t max_iteration,
   uint32_t* const num_executed_iterations, /* stats */
+  const uint8_t* deleted_rows_ptr,
   SAMPLE_FILTER_T sample_filter)
 {
   using DATA_T     = typename DATASET_DESCRIPTOR_T::DATA_T;
@@ -258,9 +259,18 @@ RAFT_KERNEL __launch_bounds__(1024, 1) search_kernel(
                                            visited_hash_bitlen,
                                            local_traversed_hashmap_ptr,
                                            traversed_hash_bitlen,
+                                           deleted_rows_ptr,
                                            block_id,
                                            num_blocks);
   __syncthreads();
+  // print the contents of result_indices_buffer and result_distances_buffer
+  #ifdef _KVDEBUG
+  if (threadIdx.x == 0 && block_id < 4 ) {
+  for (unsigned i = 0; i < result_buffer_size_32; ++i) {
+    printf(" Threadid = %u, Blockid = %u, Index[%u] = %u, Distance[%u] = %f\n", threadIdx.x, block_id, i, 
+      result_indices_buffer[i], i, static_cast<float>(result_distances_buffer[i]));
+  }}
+  #endif
   _CLK_REC(clk_compute_1st_distance);
 
   uint32_t iter = 0;
@@ -531,6 +541,59 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
                     SampleFilterT sample_filter,
                     cudaStream_t stream)
 {
+  select_and_run(dataset_desc,
+                 graph,
+                 source_indices_ptr,
+                 topk_indices_ptr,
+                 topk_distances_ptr,
+                 queries_ptr,
+                 num_queries,
+                 dev_seed_ptr,
+                 num_executed_iterations,
+                 ps,
+                 topk,
+                 block_size,
+                 result_buffer_size,
+                 smem_size,
+                 visited_hash_bitlen,
+                 traversed_hash_bitlen,
+                 traversed_hashmap_ptr,
+                 num_cta_per_query,
+                 num_seeds,
+                 nullptr,
+                 sample_filter,
+                 stream);
+}
+
+template <typename DataT,
+          typename IndexT,
+          typename DistanceT,
+          typename SourceIndexT,
+          typename SampleFilterT>
+void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dataset_desc,
+                    raft::device_matrix_view<const IndexT, int64_t, raft::row_major> graph,
+                    const SourceIndexT* source_indices_ptr,
+                    IndexT* topk_indices_ptr,       // [num_queries, topk]
+                    DistanceT* topk_distances_ptr,  // [num_queries, topk]
+                    const DataT* queries_ptr,       // [num_queries, dataset_dim]
+                    uint32_t num_queries,
+                    const IndexT* dev_seed_ptr,         // [num_queries, num_seeds]
+                    uint32_t* num_executed_iterations,  // [num_queries,]
+                    const search_params& ps,
+                    uint32_t topk,
+                    // multi_cta_search (params struct)
+                    uint32_t block_size,  //
+                    uint32_t result_buffer_size,
+                    uint32_t smem_size,
+                    uint32_t visited_hash_bitlen,
+                    int64_t traversed_hash_bitlen,
+                    IndexT* traversed_hashmap_ptr,
+                    uint32_t num_cta_per_query,
+                    uint32_t num_seeds,
+                    const uint8_t* deleted_rows_ptr,
+                    SampleFilterT sample_filter,
+                    cudaStream_t stream)
+{
   auto kernel =
     search_kernel_config<dataset_descriptor_base_t<DataT, IndexT, DistanceT>,
                          SourceIndexT,
@@ -573,6 +636,7 @@ void select_and_run(const dataset_descriptor_host<DataT, IndexT, DistanceT>& dat
                                                        ps.min_iterations,
                                                        ps.max_iterations,
                                                        num_executed_iterations,
+                                                       deleted_rows_ptr,
                                                        sample_filter);
 }
 
