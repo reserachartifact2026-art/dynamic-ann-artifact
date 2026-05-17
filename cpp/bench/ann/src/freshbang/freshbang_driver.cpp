@@ -21,7 +21,7 @@
 namespace {
 
 enum class dataset_dtype { kFloat32, kInt32, kUInt8, kInt8, kUnknown };
-#define PIPELINE_RUNS 1 // > 1, not working now
+#define PIPELINE_RUNS 0 // > 1, not working now
 
 struct DriverConfig {
   std::string data_prefix;
@@ -170,8 +170,8 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
   if (!skip_build) {
     std::cout << "[freshbang_driver] BuildIndex(rows=1000 out of " << base_blob.n_rows()
               << ", cols=" << base_blob.n_cols() << ")" << std::endl;
-    //if (!freshbang.BuildIndex(base_blob.data(), base_blob.n_rows())) {
- if (!freshbang.BuildIndex(base_blob.data(), 1000)) {
+  if (!freshbang.BuildIndex(base_blob.data(), base_blob.n_rows())) {
+ 
       std::cerr << "[freshbang_driver] BuildIndex failed" << std::endl;
       return 1;
     }
@@ -430,7 +430,7 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
     std::cout << "[freshbang_driver] Post-delete search pipeline completed" << std::endl;
 #endif
   }
-
+  freshbang.SaveIndex();
   // final cleanup
   //freshbang.Cleanup();
   return 0;

@@ -371,11 +371,10 @@ bool FreshBANG<T>::BuildIndex(const T* base_vectors, uint32_t num_basevectors)
               << std::endl;
   }
 
-    std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
-  //algo_obj->save(impl->index_file());
+  std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
   algo_obj->save("/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before");
   std::cout << "[FreshBANG::BuildIndex] save() completed" << std::endl;
-  impl->set_has_live_index(true); 
+  impl->set_has_live_index(true);
 
   return true;
 }
@@ -445,12 +444,12 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
   std::cout << "[FreshBANG::SetSearchParams] algo_property.dataset_memory_type="
             << static_cast<int>(algo_property.dataset_memory_type)
             << " algo_property.query_memory_type=" << static_cast<int>(algo_property.query_memory_type)
-            << std::endl;  
-  // ToDo: Is it really required? 
+            << std::endl;
+  // ToDo: Is it really required?
   // Store dataset (lifetime) and algo_property (for query staging in BatchedSearch)
   impl->set_algo_property(algo_property);
-   
-  
+
+
 
   // We need to explicitly set the dataset, the previous build step wouldn't set it for us
   if (search_param->needs_dataset()) { // returns always true for Cagra
@@ -464,17 +463,17 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
                                    dataset_for_search->base_set_size());
     }
   }
- 
+
 
   algo_obj->set_search_param(*search_param,
                              dataset_for_search->filter_bitset(algo_property.dataset_memory_type));
   user_search_params_ = params;
- 
-    std::cout << "[FreshBANG::BuildIndex] Calling save('" << impl->index_file() << "')" << std::endl;
-  algo_obj->save(impl->index_file());
-  std::cout << "[FreshBANG::BuildIndex] save() completed" << std::endl;
-  impl->set_has_live_index(true); 
 
+  impl->set_has_live_index(true);
+
+  // Sort the adjacency list (default is a no-op for non-supporting algos).
+  algo_obj->preprocess_built_index();
+  
   return true;
 }
 
@@ -575,7 +574,7 @@ void FreshBANG<T>::BatchedSearch(
     }
     neighbors[i] = static_cast<uint32_t>(n);
   }
-  
+
 }
 
 template <typename T>
@@ -716,7 +715,7 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
   if (use_build_path) {
     std::cerr << "[FreshBANG::BatchedInsert] Warning: index unavailable for insert at '"
           << impl->index_file() << "'. Treating insert as build operation." << std::endl;
-    
+
     algo_obj->set_build_output_file(impl->index_file());
     std::cout << "[FreshBANG::BatchedInsert] Calling build() with " << batch_size << " vectors"
               << std::endl;
@@ -730,14 +729,14 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
                 << std::endl;
     }
     std::cout << "[FreshBANG::BatchedInsert] Calling save('" << impl->index_file() << "')" << std::endl;
-    algo_obj->save(impl->index_file());
+    algo_obj->save("/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before");
     std::cout << "[FreshBANG::BatchedInsert] save() completed" << std::endl;
     impl->set_has_live_index(true);
     impl->set_prefer_insert_dataset_for_search(true);
     // ToDo: check if we can assign hostside insertvectors like this directly.
 /*        algo_obj->set_search_dataset(insertvectors,
                                  batch_size);
-  */                             
+  */
   }
   else {
   impl->set_prefer_insert_dataset_for_search(false);
@@ -791,7 +790,6 @@ void FreshBANG<T>::BatchedDelete(const uint64_t* ids, uint32_t batch_size)
   }
 
   algo_obj->delete_vectors(ids, static_cast<size_t>(batch_size));
-  algo_obj->save(impl->index_file());
   std::cout << "[FreshBANG::BatchedDelete] delete() completed with index saved" << std::endl;
 }
 
@@ -805,7 +803,7 @@ void FreshBANG<T>::Cleanup()
     return;
   }
 
-  // if index file exists, remove it 
+  // if index file exists, remove it
   std::filesystem::path index_path(impl->index_file());
   if (std::filesystem::exists(index_path)) {
     std::error_code ec;
@@ -819,7 +817,39 @@ void FreshBANG<T>::Cleanup()
   }
   delete impl;
   m_pImpl = nullptr;
-  
+
+}
+
+template <typename T>
+void FreshBANG<T>::SaveIndex()
+{
+  std::cout << "[FreshBANG::SaveIndex] called" << std::endl;
+  auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  if (impl == nullptr) {
+    std::cerr << "[FreshBANG::SaveIndex] Error: CreateAlgo() must be called before SaveIndex()."
+              << std::endl;
+    return;
+  }
+
+  auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
+                                                            impl->algo_name(),
+                                                            cuvs::bench::get_dtype_string<T>(),
+                                                            impl->dim(),
+                                                            std::chrono::minutes(60));
+  if (!cached.has_value()) {
+    std::cerr << "[FreshBANG::SaveIndex] Error: algo cache miss for index file "
+              << impl->index_file() << ". Call CreateAlgo() again." << std::endl;
+    return;
+  }
+
+  auto* algo_obj = static_cast<cuvs::bench::algo<T>*>(cached->algo_ptr);
+  if (algo_obj == nullptr) {
+    std::cerr << "[FreshBANG::SaveIndex] Error: cached algo pointer is null." << std::endl;
+    return;
+  }
+
+  algo_obj->save(impl->index_file());
+  std::cout << "[FreshBANG::SaveIndex] save() completed" << std::endl;
 }
 
 // freshbang.hpp already has the explicit instantiation; no duplicate needed here.

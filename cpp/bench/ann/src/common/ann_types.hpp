@@ -201,6 +201,12 @@ class algo : public algo_base {
   virtual void set_build_output_file(const std::string& /*file*/) {}
 
   /**
+   * Optional post-build preprocessing hook.
+   * Default implementation is a no-op; algorithms that need it can override.
+   */
+  virtual void preprocess_built_index() {}
+
+  /**
    * Make a shallow copy of the algo wrapper that shares the resources and ensures thread-safe
    * access to them. */
   virtual auto copy() -> std::unique_ptr<algo<T>> = 0;

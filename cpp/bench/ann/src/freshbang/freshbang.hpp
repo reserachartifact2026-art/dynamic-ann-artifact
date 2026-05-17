@@ -60,7 +60,6 @@ public:
     // Important note on IDs: These are semantically slot or row numbers and not running numbers. 
     // Therefore, they are in the range 0 - N-1 where N = BuildParams.dataset_rows. 
     // These are re-used across deletes and inserts. 
-
     void BatchedSearch(const T* searchvectors, 
                         uint32_t batch_size,
                         uint64_t* ids,
@@ -75,6 +74,7 @@ public:
     void BatchedDelete(const uint64_t* ids, 
                         uint32_t batch_size);
 
+    void SaveIndex();
     void Cleanup();
     
     virtual ~FreshBANG();
