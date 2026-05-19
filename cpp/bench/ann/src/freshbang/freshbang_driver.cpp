@@ -21,7 +21,7 @@
 namespace {
 
 enum class dataset_dtype { kFloat32, kInt32, kUInt8, kInt8, kUnknown };
-#define PIPELINE_RUNS 0 // > 1, not working now
+#define PIPELINE_RUNS 3 // > 1, not working now
 
 struct DriverConfig {
   std::string data_prefix;
@@ -175,6 +175,8 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
       std::cerr << "[freshbang_driver] BuildIndex failed" << std::endl;
       return 1;
     }
+    // save the index, subsequent insert/delete check for existence of a built index file
+    freshbang.SaveIndex();
     std::cout << "[freshbang_driver] Build pipeline completed successfully" << std::endl;
   } else {
     std::cout << "[freshbang_driver] --skipbuild enabled: skipping BuildIndex and testing"
@@ -221,6 +223,40 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
                 << "]; insert IDs will start at " << next_insert_id << std::endl;
     }
   }
+
+  auto validate_id_range = [&](const char* phase_label,
+                               uint64_t first_id,
+                               uint64_t count) -> bool {
+    if (count == 0) { return true; }
+
+    if (build_params.dataset_rows == 0) {
+      std::cerr << "[freshbang_driver] " << phase_label
+                << " aborted: dataset_rows is 0, so no valid IDs are available." << std::endl;
+      return false;
+    }
+
+    auto max_valid_id = static_cast<uint64_t>(build_params.dataset_rows) - 1;
+    auto last_id      = first_id + count - 1;
+    if (first_id > max_valid_id || last_id > max_valid_id) {
+      std::cerr << "[freshbang_driver] " << phase_label << " aborted: requested IDs ["
+                << first_id << ", " << last_id << "] exceed valid range [0, "
+                << max_valid_id << "] derived from dataset_rows="
+                << build_params.dataset_rows << std::endl;
+      return false;
+    }
+
+    return true;
+  };
+
+  auto validate_ids_within_bounds = [&](const char* phase_label,
+                                        const std::vector<uint64_t>& ids_to_check) -> bool {
+    if (ids_to_check.empty()) { return true; }
+
+    auto [min_it, max_it] = std::minmax_element(ids_to_check.begin(), ids_to_check.end());
+    if (*min_it > *max_it) { return true; }
+
+    return validate_id_range(phase_label, *min_it, (*max_it - *min_it) + 1);
+  };
 
   auto run_search_phase = [&](const char* phase_label) -> double {
     std::cout << "[freshbang_driver] " << phase_label << " (batch_size=" << batch_size
@@ -305,6 +341,13 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
     for (uint32_t i = 0; i < insert_batch_size; ++i) {
       insert_ids[i] = next_insert_id + static_cast<uint64_t>(i);
     }
+
+    if (!validate_id_range("BatchedInsert",
+                           next_insert_id,
+                           static_cast<uint64_t>(insert_batch_size))) {
+      return false;
+    }
+
     const uint64_t* insert_ids_ptr = insert_ids.data();
     std::cout << "[freshbang_driver] Insert IDs range: [" << next_insert_id << ", "
               << (next_insert_id + static_cast<uint64_t>(insert_batch_size) - 1) << "]"
@@ -343,6 +386,8 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
       std::cout << "[freshbang_driver] No inserted IDs; skipping BatchedDelete" << std::endl;
       return true;
     }
+
+    if (!validate_ids_within_bounds("BatchedDelete", ids_to_delete)) { return false; }
 
     std::cout << "[freshbang_driver] BatchedDelete(batch_size=" << ids_to_delete.size()
               << ") using inserted IDs [" << ids_to_delete.front() << ".."
@@ -415,7 +460,7 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
       return 1;
     }
     std::cout << "[freshbang_driver] Post-insert search pipeline completed" << std::endl;
-#if 0
+#if 1
     if (!run_delete_phase(inserted_ids_for_delete)) {
       return 1;
     }

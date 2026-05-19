@@ -44,19 +44,34 @@
 #include <unordered_set>
 #include <vector>
 
-#ifndef CUVS_USE_CUDA_ALLOC_FOR_INSERT
-#define CUVS_USE_CUDA_ALLOC_FOR_INSERT 0
-#endif
+#define DIST_THREDHOLD1_INDEX 15
+#define DIST_THREDHOLD2_INDEX 31
 
 namespace cuvs::bench {
 
 namespace detail {
+template <typename T>
+void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
+                                    size_t num_ids,
+                                    const uint32_t* graph,
+                                    int64_t graph_rows,
+                                    int64_t graph_cols,
+                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
+                                    const std::shared_ptr<rmm::device_buffer>& d_distance_threshold1,
+                                    const std::shared_ptr<rmm::device_buffer>& d_distance_threshold2,
+                                    const T* h_insert_vectors,
+                                    T* d_dataset_vectors,
+                                    int vector_dim,
+                                    const algo_base::index_type* d_search_neighbors,
+                                    const float* d_search_distances,
+                                    int recall_at_k);
+
 void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                     size_t num_ids,
                                     const uint32_t* graph,
                                     int64_t graph_rows,
                                     int64_t graph_cols,
-                                    std::shared_ptr<rmm::device_buffer> d_deleted_rows);
+                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows);
 }
 
 enum class AllocatorType { kHostPinned, kHostHugePage, kDevice };
@@ -387,7 +402,7 @@ void cuvs_cagra<T, IdxT>::preprocess_built_index()
   auto cols       = graph_view.extent(1);
   if (rows == 0 || cols == 0) { return; }
 
-  if (!dataset_ || dataset_->extent(0) < rows || dataset_->extent(1) < dim_) {
+  if (!dataset_ || dataset_->extent(0) < rows || dataset_->extent(1) < dim_ || rows != rows_) {
     throw std::runtime_error(
       "preprocess_built_index: dataset_ is not initialized or has incompatible extents.");
   }
@@ -466,17 +481,35 @@ void cuvs_cagra<T, IdxT>::preprocess_built_index()
     });
 
     int64_t out_col = 0;
+    std::vector<float> distance_threshold1(static_cast<size_t>(rows), uint8_t{0});
+    std::vector<float> distance_threshold2(static_cast<size_t>(rows), uint8_t{0});
     for (const auto& [dist, nb] : valid_neighbors) {
-      (void)dist;
+      
       host_graph[static_cast<size_t>(r * cols + out_col)] = nb;
+      if (out_col == DIST_THREDHOLD1_INDEX) {
+        distance_threshold1[static_cast<size_t>(r)] = dist;
+      }
+      if (out_col == DIST_THREDHOLD2_INDEX) {
+        distance_threshold2[static_cast<size_t>(r)] = dist;
+      }
       ++out_col;
     }
+    // dont think any element would get into this
     for (auto nb : invalid_neighbors) {
       if (out_col >= cols) { break; }
       host_graph[static_cast<size_t>(r * cols + out_col)] = nb;
+      if (out_col == DIST_THREDHOLD1_INDEX) {
+        distance_threshold1[static_cast<size_t>(r)] =  raft::upper_bound<float>();
+      }
+      if (out_col == DIST_THREDHOLD2_INDEX) {
+        distance_threshold2[static_cast<size_t>(r)] =  raft::upper_bound<float>();
+      }
       ++out_col;
     }
   }
+
+  
+    
 
   if (!graph_ || graph_->extent(0) != rows || graph_->extent(1) != cols) {
     *graph_ = raft::make_device_mdarray<IdxT, int64_t>(
@@ -852,7 +885,7 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
   
   //ToDo: Temp hack to let cuvs_bench know which are valid/delete rows in the graph for --search option
   RAFT_CUDA_TRY(cudaMemsetAsync(
-    d_deleted_rows_->data(), 0, static_cast<size_t>(1000) * sizeof(uint8_t), handle_.get_sync_stream()));
+    d_deleted_rows_->data(), 0, static_cast<size_t>(9000) * sizeof(uint8_t), handle_.get_sync_stream()));
     raft::resource::sync_stream(handle_);
   
 }
@@ -1275,7 +1308,8 @@ void cuvs_cagra<T, IdxT>::insert_wait(const T* vectors, size_t num_vectors, cons
 template <typename T, typename IdxT>  
 void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uint64_t* ids)
 {
-  #if 0
+
+ 
   if (num_vectors == 0) { return; }
   if (vectors == nullptr) {
     throw std::runtime_error("insert requires a non-null vectors pointer when num_vectors > 0");
@@ -1311,7 +1345,6 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
     queries = device_vectors_buf->data();
   }
-
 
   auto graph_view = index_->graph();
   if (graph_view.extent(0) == 0) {
@@ -1373,6 +1406,43 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
             nullptr);
   raft::resource::sync_stream(handle_);
 
+  //auto graph_view = index_->graph();
+  auto* graph_ptr = reinterpret_cast<const uint32_t*>(graph_view.data_handle());
+  auto graph_rows = graph_view.extent(0);
+  auto graph_cols = graph_view.extent(1);
+  auto* cached_graph_ptr = graph_ ? reinterpret_cast<const void*>(graph_->data_handle()) : nullptr;
+  auto cached_graph_rows = graph_ ? graph_->extent(0) : int64_t{0};
+  auto cached_graph_cols = graph_ ? graph_->extent(1) : int64_t{0};
+  // get handle to dataset pointer
+  auto* dataset_ptr = reinterpret_cast<T*>(dataset_->data_handle());
+
+  std::printf(
+    "[insert_vectors] num_ids=%zu idx_graph_ptr=%p idx_rows=%lld idx_cols=%lld cached_graph_ptr=%p "
+    "cached_rows=%lld cached_cols=%lld dataset_ptr=%p\n",
+    num_vectors,
+    (const void*)graph_ptr,
+    (long long)graph_rows,
+    (long long)graph_cols,
+    cached_graph_ptr,
+    (long long)cached_graph_rows,
+    (long long)cached_graph_cols,
+    (const void*)dataset_ptr);
+  detail::launch_cuvs_bang_insert_kernel(ids,
+                                         num_vectors,
+                                         graph_ptr,
+                                         graph_rows,
+                                         graph_cols,
+                                         d_deleted_rows_,
+                                         d_dist_threshold1_,
+                                         d_dist_threshold2_,
+                                         vectors,
+                                         dataset_ptr,
+                                         dim_,
+                                        neighbors,
+                                        distances,
+                                        k);
+
+ #if 0
   bool queries_on_device = raft::get_device_for_address(queries) >= 0;
   std::vector<T> host_queries(static_cast<size_t>(batch_size) * static_cast<size_t>(dim_));
   if (queries_on_device) {

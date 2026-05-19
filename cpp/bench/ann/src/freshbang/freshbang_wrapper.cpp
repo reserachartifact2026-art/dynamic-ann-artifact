@@ -473,7 +473,7 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
 
   // Sort the adjacency list (default is a no-op for non-supporting algos).
   algo_obj->preprocess_built_index();
-  
+
   return true;
 }
 
@@ -728,7 +728,7 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
       std::cout << "[FreshBANG::BatchedInsert] Ensured directory exists: " << index_path.parent_path()
                 << std::endl;
     }
-    std::cout << "[FreshBANG::BatchedInsert] Calling save('" << impl->index_file() << "')" << std::endl;
+     std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
     algo_obj->save("/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before");
     std::cout << "[FreshBANG::BatchedInsert] save() completed" << std::endl;
     impl->set_has_live_index(true);
