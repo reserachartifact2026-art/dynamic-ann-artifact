@@ -1,3 +1,5 @@
+#define RAFT_SYSTEM_LITTLE_ENDIAN 1
+
 #include <raft/core/resources.hpp>
 #include <raft/core/serialize.hpp>
 #include <raft/core/host_mdarray.hpp>
@@ -8,16 +10,19 @@
 #include <stack>
 #include <cstring>
 #include <stdexcept>
+#include <cmath>
+#include <map>
 
 using IdxT = uint32_t;
 
-// ---------------------------------------------
-// Load cuVS / CAGRA kNN graph
-// ---------------------------------------------
+// ================================================================
+// Graph
+// ================================================================
+
 struct Graph {
     uint32_t n_rows;
     uint32_t degree;
-    std::vector<IdxT> adj; // adjacency list: n_rows * degree
+    std::vector<IdxT> adj;
 };
 
 Graph load_graph(const std::string& path)
@@ -26,16 +31,23 @@ Graph load_graph(const std::string& path)
     Graph G;
 
     std::ifstream is(path, std::ios::binary);
-    if (!is) throw std::runtime_error("Cannot open graph file: " + path);
+
+    if (!is)
+        throw std::runtime_error("Cannot open graph file: " + path);
 
     char dtype_string[4];
     is.read(dtype_string, 4);
 
     int version   = raft::deserialize_scalar<int>(handle, is);
+
     G.n_rows      = raft::deserialize_scalar<uint32_t>(handle, is);
+
     uint32_t dim  = raft::deserialize_scalar<uint32_t>(handle, is);
+
     G.degree      = raft::deserialize_scalar<uint32_t>(handle, is);
-    int metric = raft::deserialize_scalar<int>(handle, is);
+
+    int metric =
+        raft::deserialize_scalar<int>(handle, is);
 
     std::cout << "Loaded graph:\n";
     std::cout << "  n_rows  = " << G.n_rows << "\n";
@@ -43,139 +55,278 @@ Graph load_graph(const std::string& path)
     std::cout << "  dim     = " << dim << "\n";
     std::cout << "  metric  = " << metric << "\n\n";
 
-    auto md = raft::make_host_matrix<IdxT, int64_t>(G.n_rows, G.degree);
+    auto md = raft::make_host_matrix<IdxT, int64_t>(
+        G.n_rows,
+        G.degree);
+
     raft::deserialize_mdspan(handle, is, md.view());
 
     G.adj.resize(size_t(G.n_rows) * G.degree);
-    std::memcpy(G.adj.data(), md.view().data_handle(),
-                G.adj.size() * sizeof(IdxT));
+
+    std::memcpy(
+        G.adj.data(),
+        md.view().data_handle(),
+        G.adj.size() * sizeof(IdxT));
 
     return G;
 }
 
-// ---------------------------------------------
-// TARJAN's Strongly Connected Components
-// ---------------------------------------------
+// ================================================================
+// Row Range Validation Helper
+// ================================================================
+
+struct RowRange {
+    bool enabled = false;
+    int start = 0;
+    int end = -1;
+
+    bool contains(int v) const {
+        if (!enabled) return true;
+        return v >= start && v <= end;
+    }
+};
+
+// ================================================================
+// SCC Result
+// ================================================================
+
 struct SCCResult {
     int num_scc;
-    std::vector<int> comp;  // comp[i] = SCC index for node i
-    std::vector<int> size;  // size of each SCC
+    std::vector<int> comp;
+    std::vector<int> size;
 };
+
+// ================================================================
+// Tarjan SCC
+// ================================================================
 
 class TarjanSCC {
 public:
-    TarjanSCC(const Graph& G)
-        : N(G.n_rows), K(G.degree), G(G),
-          index(N, -1), low(N, 0), onstack(N, false), comp(N, -1),
-          currentIndex(0), sccCount(0) {}
+    TarjanSCC(
+        const Graph& G,
+        const RowRange& range)
+        : N(G.n_rows),
+          K(G.degree),
+          G(G),
+          range(range),
+          index(N, -1),
+          low(N, 0),
+          onstack(N, false),
+          comp(N, -1),
+          currentIndex(0),
+          sccCount(0)
+    {}
 
-    SCCResult run() {
-        for (int v = 0; v < N; v++) {
-            if (index[v] == -1) dfs(v);
+    SCCResult run()
+    {
+        int start =
+            range.enabled ? range.start : 0;
+
+        int end =
+            range.enabled ? range.end : (N - 1);
+
+        for (int v = start; v <= end; v++) {
+
+            if (index[v] == -1)
+                dfs(v);
         }
 
-        // Count SCC sizes
+        // Count SCC sizes only within range
         std::vector<int> sizes(sccCount, 0);
-        for (int v = 0; v < N; v++)
-            sizes[comp[v]]++;
+
+        for (int v = start; v <= end; v++) {
+
+            if (comp[v] >= 0)
+                sizes[comp[v]]++;
+        }
 
         return { sccCount, comp, sizes };
     }
 
 private:
     int N, K;
-    const Graph& G;
 
-    std::vector<int> index;    // DFS order index
-    std::vector<int> low;      // low-link values
+    const Graph& G;
+    const RowRange& range;
+
+    std::vector<int> index;
+    std::vector<int> low;
     std::vector<bool> onstack;
-    std::vector<int> comp;     // component assignment
+    std::vector<int> comp;
 
     std::stack<int> S;
+
     int currentIndex;
     int sccCount;
 
-    void dfs(int v) {
+    void dfs(int v)
+    {
         index[v] = low[v] = currentIndex++;
+
         S.push(v);
+
         onstack[v] = true;
 
         const IdxT* nbrs = &G.adj[v * K];
 
         for (int j = 0; j < K; j++) {
+
             int w = nbrs[j];
-            if (w >= N) continue; // out of bounds safety
+
+            if (w >= N)
+                continue;
+
+            // ----------------------------------------------------
+            // Bail out if traversal leaves permitted range
+            // ----------------------------------------------------
+            if (!range.contains(w)) {
+
+                std::cerr
+                    << "ERROR: Traversal escaped row range.\n"
+                    << "Edge: "
+                    << v
+                    << " -> "
+                    << w
+                    << "\n";
+
+                std::exit(1);
+            }
 
             if (index[w] == -1) {
+
                 dfs(w);
-                low[v] = std::min(low[v], low[w]);
-            } 
+
+                low[v] =
+                    std::min(low[v], low[w]);
+            }
             else if (onstack[w]) {
-                low[v] = std::min(low[v], index[w]);
+
+                low[v] =
+                    std::min(low[v], index[w]);
             }
         }
 
-        // If v is root of an SCC
+        // --------------------------------------------------------
+        // SCC root
+        // --------------------------------------------------------
         if (low[v] == index[v]) {
+
             while (true) {
-                int w = S.top(); S.pop();
+
+                int w = S.top();
+
+                S.pop();
+
                 onstack[w] = false;
+
                 comp[w] = sccCount;
-                if (w == v) break;
+
+                if (w == v)
+                    break;
             }
+
             sccCount++;
         }
     }
 };
 
-// ---------------------------------------------
-// Weakly Connected Components (undirected BFS)
-// ---------------------------------------------
+// ================================================================
+// WCC Result
+// ================================================================
+
 struct WCCResult {
     int num_wcc;
-    std::vector<int> comp;   // comp[i] = WCC id of node i
-    std::vector<int> size;   // size of each WCC
+    std::vector<int> comp;
+    std::vector<int> size;
 };
 
-WCCResult compute_wcc(const Graph& G)
+// ================================================================
+// Weakly Connected Components
+// ================================================================
+
+WCCResult compute_wcc(
+    const Graph& G,
+    const RowRange& range)
 {
     int N = G.n_rows;
     int K = G.degree;
 
     std::vector<int> comp(N, -1);
+
     int wccCount = 0;
 
-    // Build undirected adjacency list
+    // ------------------------------------------------------------
+    // Build undirected graph
+    // ------------------------------------------------------------
     std::vector<std::vector<int>> undirected(N);
-    undirected.reserve(N);
 
-    for (int u = 0; u < N; u++) {
+    int start =
+        range.enabled ? range.start : 0;
+
+    int end =
+        range.enabled ? range.end : (N - 1);
+
+    for (int u = start; u <= end; u++) {
+
         const IdxT* nbrs = &G.adj[u * K];
+
         for (int j = 0; j < K; j++) {
+
             int v = nbrs[j];
-            if (v >= N || v == u) continue;
+
+            if (v >= N || v == u)
+                continue;
+
+            // ----------------------------------------------------
+            // Bail out if edge leaves row range
+            // ----------------------------------------------------
+            if (!range.contains(v)) {
+
+                std::cerr
+                    << "ERROR: Traversal escaped row range.\n"
+                    << "Edge: "
+                    << u
+                    << " -> "
+                    << v
+                    << "\n";
+
+                std::exit(1);
+            }
 
             undirected[u].push_back(v);
-            undirected[v].push_back(u);  // reverse edge
+
+            undirected[v].push_back(u);
         }
     }
 
-    // BFS over undirected graph
+    // ------------------------------------------------------------
+    // BFS
+    // ------------------------------------------------------------
     std::vector<int> stack;
+
     stack.reserve(N);
 
-    for (int i = 0; i < N; i++) {
-        if (comp[i] != -1) continue;
+    for (int i = start; i <= end; i++) {
+
+        if (comp[i] != -1)
+            continue;
 
         comp[i] = wccCount;
+
         stack.clear();
+
         stack.push_back(i);
 
         for (size_t p = 0; p < stack.size(); p++) {
+
             int u = stack[p];
+
             for (int v : undirected[u]) {
+
                 if (comp[v] == -1) {
+
                     comp[v] = wccCount;
+
                     stack.push_back(v);
                 }
             }
@@ -184,76 +335,136 @@ WCCResult compute_wcc(const Graph& G)
         wccCount++;
     }
 
-    // Count WCC sizes
+    // ------------------------------------------------------------
+    // Count sizes
+    // ------------------------------------------------------------
     std::vector<int> sizes(wccCount, 0);
-    for (int i = 0; i < N; i++)
-        sizes[comp[i]]++;
+
+    for (int i = start; i <= end; i++) {
+
+        if (comp[i] >= 0)
+            sizes[comp[i]]++;
+    }
 
     return { wccCount, comp, sizes };
 }
 
-#include <cmath>
-#include <map>
+// ================================================================
+// Degree Statistics
+// ================================================================
 
-void print_degree_stats(const Graph& G)
+void print_degree_stats(
+    const Graph& G,
+    const RowRange& range)
 {
     int N = G.n_rows;
     int K = G.degree;
 
-    long long total_out = 0, total_in = 0;
+    int start =
+        range.enabled ? range.start : 0;
+
+    int end =
+        range.enabled ? range.end : (N - 1);
+
+    int total_nodes =
+        end - start + 1;
+
+    long long total_out = 0;
+    long long total_in  = 0;
 
     std::vector<int> indeg(N, 0);
     std::vector<int> outdeg(N, 0);
 
+    // ------------------------------------------------------------
     // Compute degrees
-    for (int u = 0; u < N; u++) {
+    // ------------------------------------------------------------
+    for (int u = start; u <= end; u++) {
+
         const IdxT* nbrs = &G.adj[u * K];
 
         for (int j = 0; j < K; j++) {
+
             int v = nbrs[j];
-            if (v >= N || v == u) continue;
+
+            if (v >= N || v == u)
+                continue;
+
+            // ----------------------------------------------------
+            // Bail out if edge leaves range
+            // ----------------------------------------------------
+            if (!range.contains(v)) {
+
+                std::cerr
+                    << "ERROR: Traversal escaped row range.\n"
+                    << "Edge: "
+                    << u
+                    << " -> "
+                    << v
+                    << "\n";
+
+                std::exit(1);
+            }
 
             outdeg[u]++;
+
             indeg[v]++;
         }
     }
 
-    int min_out = outdeg[0], max_out = outdeg[0];
-    int min_in  = indeg[0],  max_in  = indeg[0];
+    int min_out = -1;
+    int max_out = 0;
 
-    for (int i = 0; i < N; i++) {
+    int min_in  = -1;
+    int max_in  = 0;
+
+    for (int i = start; i <= end; i++) {
+
         total_out += outdeg[i];
         total_in  += indeg[i];
 
-        min_out = std::min(min_out, outdeg[i]);
-        max_out = std::max(max_out, outdeg[i]);
+        if (min_out == -1 || outdeg[i] < min_out)
+            min_out = outdeg[i];
 
-        min_in = std::min(min_in, indeg[i]);
-        max_in = std::max(max_in, indeg[i]);
+        if (outdeg[i] > max_out)
+            max_out = outdeg[i];
+
+        if (min_in == -1 || indeg[i] < min_in)
+            min_in = indeg[i];
+
+        if (indeg[i] > max_in)
+            max_in = indeg[i];
     }
 
-    double avg_out = double(total_out) / N;
-    double avg_in  = double(total_in) / N;
+    double avg_out =
+        double(total_out) / total_nodes;
+
+    double avg_in =
+        double(total_in) / total_nodes;
 
     int zero_in_degree = 0;
 
-    // Count zero in-degree nodes
-    for (int i = 0; i < N; i++) {
+    for (int i = start; i <= end; i++) {
+
         if (indeg[i] == 0)
-	    zero_in_degree++;
+            zero_in_degree++;
     }
 
+    double var_out = 0.0;
+    double var_in  = 0.0;
 
-    // Standard deviation
-    double var_out = 0.0, var_in = 0.0;
+    for (int i = start; i <= end; i++) {
 
-    for (int i = 0; i < N; i++) {
-        var_out += (outdeg[i] - avg_out) * (outdeg[i] - avg_out);
-        var_in  += (indeg[i] - avg_in)   * (indeg[i] - avg_in);
+        var_out +=
+            (outdeg[i] - avg_out) *
+            (outdeg[i] - avg_out);
+
+        var_in +=
+            (indeg[i] - avg_in) *
+            (indeg[i] - avg_in);
     }
 
-    var_out /= N;
-    var_in  /= N;
+    var_out /= total_nodes;
+    var_in  /= total_nodes;
 
     double std_out = std::sqrt(var_out);
     double std_in  = std::sqrt(var_in);
@@ -261,6 +472,16 @@ void print_degree_stats(const Graph& G)
     std::cout << "\n=============================\n";
     std::cout << "Degree Statistics\n";
     std::cout << "=============================\n";
+
+    std::cout << "Row Range : "
+              << start
+              << " - "
+              << end
+              << "\n";
+
+    std::cout << "Rows Considered : "
+              << total_nodes
+              << "\n";
 
     std::cout << "\nOUT-DEGREE:\n";
     std::cout << "  Average = " << avg_out << "\n";
@@ -273,109 +494,178 @@ void print_degree_stats(const Graph& G)
     std::cout << "  Min     = " << min_in << "\n";
     std::cout << "  Max     = " << max_in << "\n";
     std::cout << "  Std Dev = " << std_in << "\n";
-    std::cout << "  Zero Degree Nodes = " << zero_in_degree << "\n";
+    std::cout << "  Zero Degree Nodes = "
+              << zero_in_degree << "\n";
+
     std::cout << "  Zero Degree %     = "
-          << (100.0 * zero_in_degree / N) << "%\n";
-
-
-    // Histogram for in-degree
-    std::map<int,int> hist_in, hist_out;
-
-    for (int i = 0; i < N; i++) {
-        hist_in[indeg[i]]++;
-        hist_out[outdeg[i]]++;
-    }
-
-    std::cout << "\n=============================\n";
-    std::cout << "In-Degree Histogram (top 20 bins)\n";
-    std::cout << "degree : count\n";
-
-    int shown = 0;
-    for (auto& p : hist_in) {
-        std::cout << "  " << p.first << " : " << p.second << "\n";
-        if (++shown == 20) break;
-    }
-
-    std::cout << "\n=============================\n";
-    std::cout << "Out-Degree Histogram (top 20 bins)\n";
-    std::cout << "degree : count\n";
-
-    shown = 0;
-    for (auto& p : hist_out) {
-        std::cout << "  " << p.first << " : " << p.second << "\n";
-        if (++shown == 20) break;
-    }
+              << (100.0 * zero_in_degree / total_nodes)
+              << "%\n";
 }
 
-// ---------------------------------------------
+// ================================================================
 // Main
-// ---------------------------------------------
+// ================================================================
+
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <graph.bin>\n";
+    RowRange range;
+
+    int argi = 1;
+
+    // ------------------------------------------------------------
+    // Parse optional row range
+    // ------------------------------------------------------------
+    if (argc > 1 &&
+        std::string(argv[argi]) == "--row-range")
+    {
+        if (argc <= argi + 2) {
+
+            std::cerr
+                << "--row-range requires start end\n";
+
+            return 1;
+        }
+
+        range.enabled = true;
+
+        range.start =
+            std::stoi(argv[argi + 1]);
+
+        range.end =
+            std::stoi(argv[argi + 2]);
+
+        argi += 3;
+    }
+
+    // ------------------------------------------------------------
+    // Usage
+    // ------------------------------------------------------------
+    if (argc - argi < 1) {
+
+        std::cerr
+            << "Usage:\n";
+
+        std::cerr
+            << "  "
+            << argv[0]
+            << " graph.bin\n";
+
+        std::cerr
+            << "  "
+            << argv[0]
+            << " --row-range start end graph.bin\n";
+
         return 1;
     }
 
-    Graph G = load_graph(argv[1]);
+    // ------------------------------------------------------------
+    // Load graph
+    // ------------------------------------------------------------
+    Graph G =
+        load_graph(argv[argi]);
 
-    print_degree_stats(G);
+    // ------------------------------------------------------------
+    // Validate row range
+    // ------------------------------------------------------------
+    if (range.enabled) {
 
-    std::cout << "Computing STRONGLY connected components (directed)...\n";
+        if (range.start < 0 ||
+            range.end >= (int)G.n_rows ||
+            range.start > range.end)
+        {
+            std::cerr
+                << "Invalid row range\n";
 
-    TarjanSCC solver(G);
-    auto result = solver.run();
-
-    std::cout << "\nStrongly Connected Components: " 
-              << result.num_scc << "\n\n";
-
-    for (int i = 0; i < result.num_scc; i++) {
-        std::cout << "  SCC " << i << " size = " << result.size[i] << "\n";
-    }
-
-    // Find largest SCC
-    int largest = 0;
-    for (int i = 1; i < result.num_scc; i++)
-        if (result.size[i] > result.size[largest])
-            largest = i;
-
-    std::cout << "\nLargest SCC: " << largest 
-              << "  (size = " << result.size[largest] << ")\n";
-
-
-    std::cout << "\nComputing WEAKLY connected components (undirected)...\n";
-
-    auto wcc = compute_wcc(G);
-
-    std::cout << "\nWeakly Connected Components: "
-              << wcc.num_wcc << "\n\n";
-
-    for (int i = 0; i < wcc.num_wcc; i++) {
-        std::cout << "  WCC " << i << " size = " << wcc.size[i] << "\n";
-    }
-
-    // Find largest WCC
-    int largest_wcc = 0;
-    for (int i = 1; i < wcc.num_wcc; i++)
-        if (wcc.size[i] > wcc.size[largest_wcc])
-            largest_wcc = i;
-
-    std::cout << "\nLargest WCC: " << largest_wcc
-              << "  (size = " << wcc.size[largest_wcc] << ")\n";
-
-for (int c = 0; c < wcc.num_wcc; c++) {
-    std::cout << "WCC " << c << " sample nodes: ";
-    int printed = 0;
-    for (int i = 0; i < G.n_rows && printed < 10; i++) {
-        if (wcc.comp[i] == c) {
-            std::cout << i << " ";
-            printed++;
+            return 1;
         }
     }
-    std::cout << "\n";
-}
 
+    // ------------------------------------------------------------
+    // Degree stats
+    // ------------------------------------------------------------
+    print_degree_stats(G, range);
+
+    // ------------------------------------------------------------
+    // SCC
+    // ------------------------------------------------------------
+    std::cout
+        << "\nComputing STRONGLY connected components...\n";
+
+    TarjanSCC solver(G, range);
+
+    auto result = solver.run();
+
+    std::cout
+        << "\nStrongly Connected Components: "
+        << result.num_scc
+        << "\n\n";
+
+    for (int i = 0; i < result.num_scc; i++) {
+
+        std::cout
+            << "  SCC "
+            << i
+            << " size = "
+            << result.size[i]
+            << "\n";
+    }
+
+    int largest = 0;
+
+    for (int i = 1; i < result.num_scc; i++) {
+
+        if (result.size[i] > result.size[largest])
+            largest = i;
+    }
+
+    std::cout
+        << "\nLargest SCC: "
+        << largest
+        << " (size = "
+        << result.size[largest]
+        << ")\n";
+
+    // ------------------------------------------------------------
+    // WCC
+    // ------------------------------------------------------------
+    std::cout
+        << "\nComputing WEAKLY connected components...\n";
+
+    auto wcc =
+        compute_wcc(G, range);
+
+    std::cout
+        << "\nWeakly Connected Components: "
+        << wcc.num_wcc
+        << "\n\n";
+
+    for (int i = 0; i < wcc.num_wcc; i++) {
+
+        std::cout
+            << "  WCC "
+            << i
+            << " size = "
+            << wcc.size[i]
+            << "\n";
+    }
+
+    int largest_wcc = 0;
+
+    for (int i = 1; i < wcc.num_wcc; i++) {
+
+        if (wcc.size[i] >
+            wcc.size[largest_wcc])
+        {
+            largest_wcc = i;
+        }
+    }
+
+    std::cout
+        << "\nLargest WCC: "
+        << largest_wcc
+        << " (size = "
+        << wcc.size[largest_wcc]
+        << ")\n";
 
     return 0;
 }
-

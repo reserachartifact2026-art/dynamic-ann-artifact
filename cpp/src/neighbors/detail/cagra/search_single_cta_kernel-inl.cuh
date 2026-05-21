@@ -562,6 +562,7 @@ __device__ void search_core(
   const std::uint32_t hash_bitlen,
   const std::uint32_t small_hash_bitlen,
   const std::uint32_t small_hash_reset_interval,
+  const uint8_t* deleted_rows_ptr,
   const std::uint32_t query_id,
   SAMPLE_FILTER_T sample_filter)
 {
@@ -652,7 +653,8 @@ __device__ void search_core(
                                            local_visited_hashmap_ptr,
                                            hash_bitlen,
                                            (INDEX_T*)nullptr,
-                                           0);
+                                           0,
+                                           deleted_rows_ptr);
   __syncthreads();
   _CLK_REC(clk_compute_1st_distance);
 
@@ -757,6 +759,7 @@ __device__ void search_core(
         terminate_flag, parent_list_buffer, result_indices_buffer, internal_topk, search_width);
       _CLK_REC(clk_pickup_parents);
     }
+
 
     // restore small-hash table by putting internal-topk indices in it
     if ((iter + 1) % small_hash_reset_interval == 0) {
@@ -987,6 +990,7 @@ RAFT_KERNEL __launch_bounds__(1024, 1) search_kernel(
   const std::uint32_t hash_bitlen,
   const std::uint32_t small_hash_bitlen,
   const std::uint32_t small_hash_reset_interval,
+  const uint8_t* deleted_rows_ptr,
   SAMPLE_FILTER_T sample_filter)
 {
   const auto query_id = blockIdx.y;
@@ -1016,6 +1020,7 @@ RAFT_KERNEL __launch_bounds__(1024, 1) search_kernel(
                                hash_bitlen,
                                small_hash_bitlen,
                                small_hash_reset_interval,
+                               deleted_rows_ptr,
                                query_id,
                                sample_filter);
 }
@@ -1107,6 +1112,7 @@ RAFT_KERNEL __launch_bounds__(1024, 1) search_kernel_p(
   const std::uint32_t hash_bitlen,
   const std::uint32_t small_hash_bitlen,
   const std::uint32_t small_hash_reset_interval,
+  const uint8_t* deleted_rows_ptr,
   SAMPLE_FILTER_T sample_filter)
 {
   using job_desc_type = job_desc_t<DATASET_DESCRIPTOR_T>;
@@ -1176,6 +1182,7 @@ RAFT_KERNEL __launch_bounds__(1024, 1) search_kernel_p(
                                  hash_bitlen,
                                  small_hash_bitlen,
                                  small_hash_reset_interval,
+                                 deleted_rows_ptr,
                                  query_id,
                                  sample_filter);
 
@@ -1803,6 +1810,7 @@ struct alignas(kCacheLineBytes) persistent_runner_t : public persistent_runner_b
     std::reference_wrapper<const dataset_descriptor_host<DataT, IndexT, DistanceT>> dataset_desc,
     raft::device_matrix_view<const index_type, int64_t, raft::row_major> graph,
     const SourceIndexT* source_indices_ptr,
+    const uint8_t* deleted_rows_ptr,
     uint32_t num_itopk_candidates,
     uint32_t block_size,  //
     uint32_t smem_size,
@@ -1820,6 +1828,7 @@ struct alignas(kCacheLineBytes) persistent_runner_t : public persistent_runner_b
     float persistent_lifetime,
     float persistent_device_usage) -> uint64_t
   {
+    (void)deleted_rows_ptr;
     return uint64_t(graph.data_handle()) ^ uint64_t(source_indices_ptr) ^
            dataset_desc.get().team_size ^ num_itopk_candidates ^ block_size ^ smem_size ^
            hash_bitlen ^ small_hash_reset_interval ^ num_random_samplings ^ rand_xor_mask ^
@@ -1831,6 +1840,7 @@ struct alignas(kCacheLineBytes) persistent_runner_t : public persistent_runner_b
     std::reference_wrapper<const dataset_descriptor_host<DataT, IndexT, DistanceT>> dataset_desc,
     raft::device_matrix_view<const index_type, int64_t, raft::row_major> graph,
     const SourceIndexT* source_indices_ptr,
+    const uint8_t* deleted_rows_ptr,
     uint32_t num_itopk_candidates,
     uint32_t block_size,  //
     uint32_t smem_size,
@@ -1859,6 +1869,7 @@ struct alignas(kCacheLineBytes) persistent_runner_t : public persistent_runner_b
       param_hash(calculate_parameter_hash(dd_host,
                                           graph,
                                           source_indices_ptr,
+                                          deleted_rows_ptr,
                                           num_itopk_candidates,
                                           block_size,
                                           smem_size,
@@ -1946,6 +1957,7 @@ struct alignas(kCacheLineBytes) persistent_runner_t : public persistent_runner_b
        &hash_bitlen,
        &small_hash_bitlen,
        &small_hash_reset_interval,
+      &deleted_rows_ptr,
        &sample_filter};
     cuda::atomic_thread_fence(cuda::memory_order_seq_cst, cuda::thread_scope_system);
     RAFT_CUDA_TRY(cudaLaunchCooperativeKernel<std::remove_pointer_t<kernel_type>>(
@@ -2138,6 +2150,7 @@ void select_and_run(
   size_t small_hash_bitlen,
   size_t small_hash_reset_interval,
   uint32_t num_seeds,
+  const uint8_t* deleted_rows_ptr,
   SampleFilterT sample_filter,
   cudaStream_t stream)
 {
@@ -2155,6 +2168,7 @@ control is returned in this thread (in persistent_runner_t constructor), so we'r
                             std::cref(dataset_desc),
                             graph,
                             source_indices_ptr,
+                            deleted_rows_ptr,
                             num_itopk_candidates,
                             block_size,
                             smem_size,
@@ -2203,6 +2217,7 @@ control is returned in this thread (in persistent_runner_t constructor), so we'r
                                                            hash_bitlen,
                                                            small_hash_bitlen,
                                                            small_hash_reset_interval,
+                                                           deleted_rows_ptr,
                                                            sample_filter);
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   }

@@ -35,6 +35,7 @@ void select_and_run(
   size_t small_hash_bitlen,
   size_t small_hash_reset_interval,
   uint32_t num_seeds,
+  const uint8_t* deleted_rows_ptr,
   SampleFilterT sample_filter,
   cudaStream_t stream);
 

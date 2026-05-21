@@ -126,6 +126,7 @@ inline float l2(
     float s = 0.0f;
 
     for (uint32_t i = 0; i < dim; i++) {
+
         float d = a[i] - b[i];
         s += d * d;
     }
@@ -142,56 +143,98 @@ int main(int argc, char** argv)
     bool check_order = false;
     int order_check_k = -1;
 
+    bool use_row_range = false;
+    int row_start = 0;
+    int row_end = -1;
+
     int argi = 1;
 
-    // ------------------------------------------------------------
-    // Optional mode:
-    // --check-order <K>
-    // ------------------------------------------------------------
-    if (argc > 1 &&
-        std::string(argv[argi]) == "--check-order")
-    {
-        check_order = true;
+    // ============================================================
+    // Parse CLI options
+    // ============================================================
 
-        if (argc <= argi + 1) {
+    while (argi < argc) {
 
-            std::cerr
-                << "--check-order requires a value\n";
+        std::string arg = argv[argi];
 
-            return 1;
+        // --------------------------------------------------------
+        // --check-order <K>
+        // --------------------------------------------------------
+        if (arg == "--check-order") {
+
+            check_order = true;
+
+            if (argi + 1 >= argc) {
+
+                std::cerr
+                    << "--check-order requires a value\n";
+
+                return 1;
+            }
+
+            order_check_k = std::stoi(argv[argi + 1]);
+
+            argi += 2;
         }
 
-        order_check_k = std::stoi(argv[argi + 1]);
+        // --------------------------------------------------------
+        // --row-range <start> <end>
+        // --------------------------------------------------------
+        else if (arg == "--row-range") {
 
-        argi += 2;
+            if (argi + 2 >= argc) {
+
+                std::cerr
+                    << "--row-range requires start and end\n";
+
+                return 1;
+            }
+
+            use_row_range = true;
+
+            row_start = std::stoi(argv[argi + 1]);
+            row_end   = std::stoi(argv[argi + 2]);
+
+            argi += 3;
+        }
+
+        else {
+            break;
+        }
     }
 
-    // ------------------------------------------------------------
+    // ============================================================
     // Usage
-    // ------------------------------------------------------------
+    // ============================================================
+
     if (argc - argi < 2) {
 
         std::cerr << "Usage:\n";
 
         std::cerr
             << "  " << argv[0]
+            << " [--row-range start end]"
             << " graph.bin vectors.fbin\n";
 
         std::cerr
             << "  " << argv[0]
-            << " --check-order <K> graph.bin vectors.fbin\n";
+            << " --check-order <K>"
+            << " [--row-range start end]"
+            << " graph.bin vectors.fbin\n";
 
         return 1;
     }
 
-    // ------------------------------------------------------------
+    // ============================================================
     // Load graph
-    // ------------------------------------------------------------
+    // ============================================================
+
     Graph G = load_graph(argv[argi]);
 
-    // ------------------------------------------------------------
+    // ============================================================
     // Load vectors
-    // ------------------------------------------------------------
+    // ============================================================
+
     uint32_t n_vecs, dim;
 
     auto vecs = load_fbin(
@@ -199,9 +242,10 @@ int main(int argc, char** argv)
         n_vecs,
         dim);
 
-    // ------------------------------------------------------------
+    // ============================================================
     // Validation
-    // ------------------------------------------------------------
+    // ============================================================
+
     if (dim != G.dim || n_vecs < G.n_rows) {
 
         std::cerr << "Dimension mismatch\n";
@@ -214,6 +258,7 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------
     // Validate ordering prefix K
     // ------------------------------------------------------------
+
     if (check_order) {
 
         if (order_check_k <= 0 ||
@@ -227,6 +272,31 @@ int main(int argc, char** argv)
             return 1;
         }
     }
+
+    // ------------------------------------------------------------
+    // Validate row range
+    // ------------------------------------------------------------
+
+    if (use_row_range) {
+
+        if (row_start < 0 ||
+            row_end >= N ||
+            row_start > row_end)
+        {
+            std::cerr
+                << "Invalid row range\n";
+
+            return 1;
+        }
+    }
+    else {
+
+        row_start = 0;
+        row_end   = N - 1;
+    }
+
+    int total_rows_considered =
+        row_end - row_start + 1;
 
     // ============================================================
     // DEFAULT MODE:
@@ -246,7 +316,7 @@ int main(int argc, char** argv)
             double local_sum = 0.0;
 
             #pragma omp for schedule(dynamic, 4)
-            for (int i = 0; i < N; i++) {
+            for (int i = row_start; i <= row_end; i++) {
 
                 dist.clear();
 
@@ -306,14 +376,31 @@ int main(int argc, char** argv)
             total_recall += local_sum;
         }
 
-        double avg = total_recall / N;
+        double avg =
+            total_recall / total_rows_considered;
 
         std::cout << "\n========================\n";
         std::cout << "Recall@K\n";
         std::cout << "========================\n";
-        std::cout << "Nodes      : " << N << "\n";
-        std::cout << "K          : " << K << "\n";
-        std::cout << "Avg Recall : " << avg << "\n";
+
+        std::cout << "Nodes                : "
+                  << N << "\n";
+
+        std::cout << "K                    : "
+                  << K << "\n";
+
+        std::cout << "Row Range            : "
+                  << row_start
+                  << " - "
+                  << row_end
+                  << "\n";
+
+        std::cout << "Rows Considered      : "
+                  << total_rows_considered
+                  << "\n";
+
+        std::cout << "Avg Recall           : "
+                  << avg << "\n";
     }
 
     // ============================================================
@@ -330,7 +417,7 @@ int main(int argc, char** argv)
             double local_sorted = 0.0;
 
             #pragma omp for schedule(dynamic, 1024)
-            for (int i = 0; i < N; i++) {
+            for (int i = row_start; i <= row_end; i++) {
 
                 const float* vi =
                     &vecs[size_t(i) * dim];
@@ -384,7 +471,8 @@ int main(int argc, char** argv)
             sorted_rows += local_sorted;
         }
 
-        double score = sorted_rows / N;
+        double score =
+            sorted_rows / total_rows_considered;
 
         std::cout << "\n========================\n";
         std::cout << "Adjacency Distance Ordering Quality\n";
@@ -398,6 +486,16 @@ int main(int argc, char** argv)
 
         std::cout << "Checked Prefix Length  : "
                   << order_check_k << "\n";
+
+        std::cout << "Row Range              : "
+                  << row_start
+                  << " - "
+                  << row_end
+                  << "\n";
+
+        std::cout << "Rows Considered        : "
+                  << total_rows_considered
+                  << "\n";
 
         std::cout << "Rows Sorted            : "
                   << sorted_rows << "\n";

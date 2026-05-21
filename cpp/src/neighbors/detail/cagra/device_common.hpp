@@ -108,9 +108,9 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes(
   const auto team_size_bits = dataset_desc.team_size_bitshift_from_smem();
   const auto max_i = raft::round_up_safe<uint32_t>(num_pickup, warp_size >> team_size_bits);
   const auto compute_distance = dataset_desc.compute_distance_impl;
-/*
+
   // Debug: print kernel launch/runtime parameters once per block.
-  if (threadIdx.x == 0) {
+  /*if (threadIdx.x == 0) {
     printf("[cagra search kernel debug] team_size_bits=%u max_i=%u num_distilation=%u "
            "num_pickup=%u rand_xor_mask=%llu num_seeds=%u\n",
            static_cast<unsigned>(team_size_bits),
@@ -119,8 +119,8 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes(
            static_cast<unsigned>(num_pickup),
            static_cast<unsigned long long>(rand_xor_mask),
            static_cast<unsigned>(num_seeds));
-  }
-*/
+  }*/
+
 
   for (uint32_t i = threadIdx.x >> team_size_bits; i < max_i; i += (blockDim.x >> team_size_bits)) {
     const bool valid_i = (i < num_pickup);
@@ -171,6 +171,8 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes(
       // Invalidate deleted rows by setting distance to upper bound sentinel
       if (deleted_rows_ptr && result_indices_ptr[i] != raft::upper_bound<IndexT>() &&
           deleted_rows_ptr[result_indices_ptr[i]] == 1) {
+        // log the deleted index and thread adn block ids for debugging
+        //printf(" Threadid = %u, Blockid = %u, Deleted index = %u\n", threadIdx.x, block_id, result_indices_ptr[i]);  
         result_distances_ptr[i] = raft::upper_bound<DistanceT>();
         result_indices_ptr[i]   = raft::upper_bound<IndexT>();
       }

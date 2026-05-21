@@ -42,7 +42,7 @@ namespace cuvs::neighbors::cagra::detail {
 namespace multi_cta_search {
 
 // #define _CLK_BREAKDOWN
-
+//#define _KVDEBUG
 template <class INDEX_T, class DISTANCE_T>
 RAFT_DEVICE_INLINE_FUNCTION void pickup_next_parent(
   INDEX_T* const next_parent_indices,
@@ -267,7 +267,7 @@ RAFT_KERNEL __launch_bounds__(1024, 1) search_kernel(
   #ifdef _KVDEBUG
   if (threadIdx.x == 0 && block_id < 4 ) {
   for (unsigned i = 0; i < result_buffer_size_32; ++i) {
-    printf(" Threadid = %u, Blockid = %u, Index[%u] = %u, Distance[%u] = %f\n", threadIdx.x, block_id, i, 
+    printf(" Query id = %u, Threadid = %u, Blockid = %u, Index[%u] = %u, Distance[%u] = %f\n", query_id, threadIdx.x, block_id, i, 
       result_indices_buffer[i], i, static_cast<float>(result_distances_buffer[i]));
   }}
   #endif

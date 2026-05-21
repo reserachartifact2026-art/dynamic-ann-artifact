@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -539,7 +540,7 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
     d_deleted_rows_ ? static_cast<const uint8_t*>(d_deleted_rows_->data()) : nullptr;
     
   // Enable cuvs logging for debugging
-  raft::default_logger().set_level( rapids_logger::level_enum::info);
+  //raft::default_logger().set_level( rapids_logger::level_enum::debug);
   if (sp.graph_mem != graph_mem_) {
     // Move graph to correct memory space
     graph_mem_ = sp.graph_mem;
@@ -629,7 +630,7 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
 
   if (build_rows_ != index_->graph().extent(0)) {
     // log error
-    std::cerr << "Warning: set_search_dataset called with nrow=" << nrow
+    std::cerr << "Warning: set_search_dataset called with build_rows_=" << build_rows_
               << " which does not match the number of rows used during build time="
               << index_->graph().extent(0) << ". This may lead to unexpected behavior." << std::endl;
               return;
@@ -875,7 +876,7 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
       ") but loaded index has " + std::to_string(index_->graph().extent(0)) + " rows.");   
   }
   rows_ = index_->graph().extent(0);
-  
+  build_rows_ = rows_;
   d_deleted_rows_         = std::make_shared<rmm::device_buffer>(
     static_cast<size_t>(rows_) * sizeof(uint8_t), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
   d_dist_threshold1_ = std::make_shared<rmm::device_buffer>(
@@ -883,9 +884,25 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
   d_dist_threshold2_ = std::make_shared<rmm::device_buffer>(
     static_cast<size_t>(rows_) * sizeof(float), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
   
-  //ToDo: Temp hack to let cuvs_bench know which are valid/delete rows in the graph for --search option
+  // log the value of delete_rows_init_size for debugging
   RAFT_CUDA_TRY(cudaMemsetAsync(
-    d_deleted_rows_->data(), 0, static_cast<size_t>(9000) * sizeof(uint8_t), handle_.get_sync_stream()));
+    d_deleted_rows_->data(), 1, rows_ * sizeof(uint8_t), handle_.get_sync_stream()));
+    raft::resource::sync_stream(handle_);
+  
+  auto delete_rows_init_size = static_cast<size_t>(1000); // default
+  if (const char* env_val = std::getenv("CUVS_BENCH_VALID_ROWS_INIT_SIZE")) {
+    try {
+      delete_rows_init_size = std::stoull(env_val);
+    } catch (...) {
+      std::cerr << "[cuvs_cagra] Warning: invalid CUVS_BENCH_VALID_ROWS_INIT_SIZE='" << env_val
+                << "'; using default 1000" << std::endl;
+    }
+  }
+
+  // log the value of delete_rows_init_size for debugging
+  std::cout << "[cuvs_cagra] Initializing deleted rows buffer with size: " << delete_rows_init_size << std::endl;
+  RAFT_CUDA_TRY(cudaMemsetAsync(
+    d_deleted_rows_->data(), 0, delete_rows_init_size * sizeof(uint8_t), handle_.get_sync_stream()));
     raft::resource::sync_stream(handle_);
   
 }

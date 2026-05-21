@@ -256,6 +256,7 @@ struct search
                    small_hash_bitlen,
                    small_hash_reset_interval,
                    num_seeds,
+                   this->deleted_rows_ptr,
                    sample_filter,
                    stream);
   }

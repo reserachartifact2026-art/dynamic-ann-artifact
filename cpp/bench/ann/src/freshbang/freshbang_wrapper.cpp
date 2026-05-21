@@ -370,10 +370,11 @@ bool FreshBANG<T>::BuildIndex(const T* base_vectors, uint32_t num_basevectors)
     std::cout << "[FreshBANG::BuildIndex] Ensured directory exists: " << index_path.parent_path()
               << std::endl;
   }
-
+#ifdef _KVDEBUG
   std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
   algo_obj->save("/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before");
   std::cout << "[FreshBANG::BuildIndex] save() completed" << std::endl;
+#endif
   impl->set_has_live_index(true);
 
   return true;
@@ -728,9 +729,11 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
       std::cout << "[FreshBANG::BatchedInsert] Ensured directory exists: " << index_path.parent_path()
                 << std::endl;
     }
-     std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
+#if _KVDEBUG    
+    std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
     algo_obj->save("/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before");
     std::cout << "[FreshBANG::BatchedInsert] save() completed" << std::endl;
+#endif    
     impl->set_has_live_index(true);
     impl->set_prefer_insert_dataset_for_search(true);
     // ToDo: check if we can assign hostside insertvectors like this directly.
