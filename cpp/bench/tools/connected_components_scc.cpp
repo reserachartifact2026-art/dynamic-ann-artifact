@@ -600,15 +600,38 @@ int main(int argc, char** argv)
         << result.num_scc
         << "\n\n";
 
-    for (int i = 0; i < result.num_scc; i++) {
 
-        std::cout
-            << "  SCC "
-            << i
-            << " size = "
-            << result.size[i]
-            << "\n";
+for (int c = 0; c < result.num_scc; c++) {
+
+    std::cout
+        << "  SCC "
+        << c
+        << " size = "
+        << result.size[c]
+        << "  sample nodes: ";
+
+    int printed = 0;
+
+    int start =
+        range.enabled ? range.start : 0;
+
+    int end =
+        range.enabled ? range.end : (G.n_rows - 1);
+
+    for (int v = start;
+         v <= end && printed < 10;
+         v++)
+    {
+        if (result.comp[v] == c) {
+
+            std::cout << v << " ";
+
+            printed++;
+        }
     }
+
+    std::cout << "\n";
+}
 
     int largest = 0;
 

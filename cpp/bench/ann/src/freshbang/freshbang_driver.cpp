@@ -85,6 +85,12 @@ auto read_freshbang_config(const std::string& config_file = "freshbang.cfg")
     // Skip comments and empty lines
     if (line.empty() || line[0] == '#') { continue; }
 
+    const auto comment_pos = line.find('#');
+    if (comment_pos != std::string::npos) {
+      line = trim_copy(line.substr(0, comment_pos));
+      if (line.empty()) { continue; }
+    }
+
     size_t delimiter_pos = line.find('=');
     if (delimiter_pos == std::string::npos) { continue; }
 
@@ -478,8 +484,10 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
   std::fill(ids.begin(), ids.end(), 0ULL);
   std::fill(neighbors.begin(), neighbors.end(), 0U);
   std::fill(distances.begin(), distances.end(), 0.0F);
-  // Run search once after all configured insert/delete operations complete.
-  run_search_phase("BatchedSearch final");
+  // Run search 3 times after all configured insert/delete operations complete.
+  for (int i = 0; i < 3; ++i) {
+    run_search_phase((std::string("BatchedSearch final") + std::to_string(i + 1)).c_str());
+  }
   if (!dump_ids_to_file(batch_size)) {
     return 1;
   }
@@ -512,6 +520,7 @@ int main(int argc, char** argv)
     std::cerr << "  Optional repeated operation lines:" << std::endl;
     std::cerr << "    insert=start,end" << std::endl;
     std::cerr << "    delete=start,end" << std::endl;
+    std::cerr << "  Lines starting with '#' are treated as comments and ignored." << std::endl;
     std::cerr << "\nExample freshbang.cfg:" << std::endl;
     std::cerr << "  data_prefix=/path/to/datasets/" << std::endl;
     std::cerr << "  index_prefix=/path/to/indices/" << std::endl;

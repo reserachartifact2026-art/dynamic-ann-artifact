@@ -65,6 +65,12 @@ auto read_freshbang_config(const std::string& config_path) -> FreshBANGConfig
     auto trimmed_line = trim_whitespace(line);
     if (trimmed_line.empty() || trimmed_line[0] == '#') { continue; }
 
+    const auto comment_pos = trimmed_line.find('#');
+    if (comment_pos != std::string::npos) {
+      trimmed_line = trim_whitespace(trimmed_line.substr(0, comment_pos));
+      if (trimmed_line.empty()) { continue; }
+    }
+
     auto separator_pos = trimmed_line.find('=');
     if (separator_pos == std::string::npos) { continue; }
 
@@ -199,7 +205,11 @@ class FreshBANGInner {
   void set_prefer_insert_dataset_for_search(bool value) { prefer_insert_dataset_for_search_ = value; }
   bool prefer_insert_dataset_for_search() const { return prefer_insert_dataset_for_search_; }
 
-  void set_has_live_index(bool value) { has_live_index_ = value; }
+  void set_has_live_index(bool value) 
+  { has_live_index_ = value;
+    // print the new value to console for debugging
+    std::cout << "[FreshBANGInner] set_has_live_index: " << std::boolalpha << has_live_index_ << std::endl; 
+  }
   bool has_live_index() const { return has_live_index_; }
 
  private:
@@ -473,7 +483,7 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
   impl->set_has_live_index(true);
 
   // Sort the adjacency list (default is a no-op for non-supporting algos).
-  algo_obj->preprocess_built_index();
+  //algo_obj->preprocess_built_index();
 
   return true;
 }
@@ -559,12 +569,32 @@ void FreshBANG<T>::BatchedSearch(
     static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(user_search_params_.recall_at_k);
   std::vector<cuvs::bench::algo_base::index_type> neighbors64(result_count, 0);
 
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    std::cerr << "[FreshBANG::BatchedSearch] Error: cudaDeviceSynchronize failed before "
+                 "timing search_ex."
+              << std::endl;
+    return;
+  }
+
+  const auto search_t0 = std::chrono::steady_clock::now();
   algo_obj->search_ex(search_queries,
                       static_cast<int>(batch_size),
                       static_cast<int>(user_search_params_.recall_at_k),
                       neighbors64.data(),
                       distances,
                       reinterpret_cast<int64_t*>(ids));
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    std::cerr << "[FreshBANG::BatchedSearch] Error: cudaDeviceSynchronize failed after "
+                 "search_ex."
+              << std::endl;
+    return;
+  }
+
+  const auto search_t1 = std::chrono::steady_clock::now();
+  const auto elapsed_sec = std::chrono::duration<double>(search_t1 - search_t0).count();
+  const auto qps = (elapsed_sec > 0.0) ? (static_cast<double>(batch_size) / elapsed_sec) : 0.0;
+  std::cout << "[FreshBANG::BatchedSearch] search_ex_only elapsed_sec=" << elapsed_sec
+            << " qps=" << qps << std::endl;
 
   for (std::size_t i = 0; i < result_count; ++i) {
     const auto n = neighbors64[i];
@@ -852,6 +882,8 @@ void FreshBANG<T>::SaveIndex()
   }
 
   algo_obj->save(impl->index_file());
+  // print the path where the index is saved for debugging
+  std::cout << "[FreshBANG::SaveIndex] Index saved to: " << impl->index_file() << std::endl;  
   std::cout << "[FreshBANG::SaveIndex] save() completed" << std::endl;
 }
 
