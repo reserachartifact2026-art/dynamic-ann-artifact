@@ -257,6 +257,6 @@ extern "C" auto cuvs_bench_create_algo_with_rows_uint8(const std::string& algo_n
 #ifdef ANN_BENCH_BUILD_MAIN
 #include "../common/benchmark.hpp"
 int main(int argc, char** argv) { 
-raft::default_logger().set_level( rapids_logger::level_enum::trace);
+//raft::default_logger().set_level( rapids_logger::level_enum::trace);
 return cuvs::bench::run_main(argc, argv); }
 #endif

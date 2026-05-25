@@ -508,9 +508,7 @@ void cuvs_cagra<T, IdxT>::preprocess_built_index()
       ++out_col;
     }
   }
-
-  
-    
+ 
 
   if (!graph_ || graph_->extent(0) != rows || graph_->extent(1) != cols) {
     *graph_ = raft::make_device_mdarray<IdxT, int64_t>(
@@ -607,10 +605,13 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
     if (dynamic_batcher_) { dynamic_batcher_.reset(); }
   }
   // print graph and dataset extents for debugging
+#ifdef KVDEBUG  
   auto graph = index_->graph();
   auto dataset = index_->dataset();
+
   std::cout << "[cuvs_cagra::set_search_param] graph extents: (" << graph.extent(0) << ", " << graph.extent(1) << ")" << std::endl;
   std::cout << "[cuvs_cagra::set_search_param] dataset extents: (" << dataset.extent(0) << ", " << dataset.extent(1) << ")" << std::endl; 
+#endif
 }
 
 template <typename T, typename IdxT>
@@ -744,9 +745,10 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
 
   // If we are attaching to a bigger dataset than the current graph size,
   // expand graph_ by replicating the last valid row.
-
+#ifdef _KVDEBUG
   std::cout << "[cuvs_cagra::set_search_dataset] expanding old graph, old_rows=" << old_rows
             << ", target_rows=" << target_rows << std::endl;
+#endif
   if (old_rows < target_rows) {
     auto mr                 = get_mr(graph_mem_);
     auto stream             = raft::resource::get_cuda_stream(handle_);
@@ -889,18 +891,20 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
     d_deleted_rows_->data(), 1, rows_ * sizeof(uint8_t), handle_.get_sync_stream()));
     raft::resource::sync_stream(handle_);
   
-  auto delete_rows_init_size = static_cast<size_t>(1000); // default
+  auto delete_rows_init_size = static_cast<size_t>(rows_); // default
   if (const char* env_val = std::getenv("CUVS_BENCH_VALID_ROWS_INIT_SIZE")) {
     try {
       delete_rows_init_size = std::stoull(env_val);
     } catch (...) {
       std::cerr << "[cuvs_cagra] Warning: invalid CUVS_BENCH_VALID_ROWS_INIT_SIZE='" << env_val
-                << "'; using default 1000" << std::endl;
+                << "'; using default " << delete_rows_init_size << std::endl;
     }
   }
 
   // log the value of delete_rows_init_size for debugging
+#ifdef _KVDEBUG
   std::cout << "[cuvs_cagra] Initializing deleted rows buffer with size: " << delete_rows_init_size << std::endl;
+#endif
   RAFT_CUDA_TRY(cudaMemsetAsync(
     d_deleted_rows_->data(), 0, delete_rows_init_size * sizeof(uint8_t), handle_.get_sync_stream()));
     raft::resource::sync_stream(handle_);
@@ -933,14 +937,13 @@ void cuvs_cagra<T, IdxT>::set_insert_param_from_json(const nlohmann::json& conf)
 #if 0
 // serialized insert
 template <typename T, typename IdxT>
-void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uint64_t* ids)
+void cuvs_cagra<T, IdxT>::insert_singlethread(const T* vectors, size_t num_vectors, const uint64_t* ids)
 {
-  (void)ids;
   if (num_vectors == 0) { return; }
-  if (vectors == nullptr) {
-    throw std::runtime_error("insert requires a non-null vectors pointer when num_vectors > 0");
-  }
+  int batch_size = static_cast<int>(num_vectors);
 
+  const T* queries = vectors;
+  // validate the graph and dataset are already loaded
   if (!index_) {
     throw std::runtime_error("Index must be loaded or built before insert operations.");
   }
@@ -948,49 +951,22 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
     throw std::runtime_error("Dataset view is not initialized; call set_search_dataset() first.");
   }
 
-  std::cout << "[insert-single] begin: num_vectors=" << num_vectors
-            << " dim=" << dim_
-            << " current_graph_rows=" << index_->graph().extent(0)
-            << " current_graph_degree=" << index_->graph().extent(1)
-            << " current_dataset_rows=" << input_dataset_v_->extent(0) << std::endl;
-
-  auto stream            = raft::resource::get_cuda_stream(handle_);
-  bool vectors_on_device = raft::get_device_for_address(vectors) >= 0;
-
-  std::unique_ptr<rmm::device_uvector<T>> device_vectors_buf;
-  const T* queries = vectors;
-  if (!vectors_on_device) {
-    device_vectors_buf = std::make_unique<rmm::device_uvector<T>>(
-      static_cast<size_t>(num_vectors) * static_cast<size_t>(dim_), stream);
-    raft::copy(device_vectors_buf->data(),
-               vectors,
-               static_cast<size_t>(num_vectors) * static_cast<size_t>(dim_),
-               stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-    queries = device_vectors_buf->data();
-  }
-
-  auto graph_view = index_->graph();
-  if (graph_view.extent(0) == 0) {
-    std::cout << "[insert-single] graph is empty, delegating to build()" << std::endl;
-    build(queries, num_vectors);
-    has_inserted_data_ = true;
-    if (insert_params_.persist && graph_file_.has_value() && !graph_file_->empty()) {
-      save(*graph_file_);
-      std::cout << "[insert-single] persisted rebuilt index to " << *graph_file_ << std::endl;
-    }
-    std::cout << "[insert-single] complete via build: graph_rows=" << index_->graph().extent(0)
-              << " dataset_rows=" << index_->data().n_rows() << std::endl;
-    return;
-  }
-
-  if (graph_view.extent(0) != input_dataset_v_->extent(0)) {
+   // verify number of nodes in the graph equals the dataset size
+  if (index_->graph().extent(0) != input_dataset_v_->extent(0)) {
     throw std::runtime_error("Graph node count must match dataset size before insert operations.");
   }
 
-  bool dataset_cache_invalid = (dataset_->extent(0) != input_dataset_v_->extent(0)) ||
-                               (dataset_->extent(1) < static_cast<int64_t>(dim_));
-  if (index_->dim() == 0 || need_dataset_update_ || dataset_cache_invalid) {
+  // if the index is empty (no graph/dataset), we can skip directly to building a 
+  // new index with the inserted data as the initial dataset  to avoid unnecessary copying and merging
+  if (index_->graph().extent(0) == 0) {
+    RAFT_LOG_DEBUG("Index is empty, skipping to build with new dataset directly.");
+    build(queries, num_vectors);
+    return;
+  }  
+
+
+  // Ensure the index has a dataset attached (deserialize may not include it).
+  if (index_->dim() == 0 || need_dataset_update_) {
     auto mr = get_mr(dataset_mem_);
     cuvs::neighbors::cagra::detail::copy_with_padding(handle_, *dataset_, *input_dataset_v_, mr);
     auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
@@ -1002,33 +978,121 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
     throw std::runtime_error("Index has dim=0 after dataset attach; load/build the index first.");
   }
 
-  auto batch_size = static_cast<int64_t>(num_vectors);
-  auto k          = static_cast<int>(index_->graph().extent(1));
-  if (k <= 0) {
-    throw std::runtime_error("Index graph has zero out-degree; cannot derive insert neighbors.");
+  auto stream = raft::resource::get_cuda_stream(handle_);
+  bool vectors_on_device = raft::get_device_for_address(vectors) >= 0;
+  std::unique_ptr<rmm::device_uvector<T>> device_vectors_buf;
+  if (!vectors_on_device) {
+    device_vectors_buf = std::make_unique<rmm::device_uvector<T>>(
+      static_cast<size_t>(num_vectors) * static_cast<size_t>(dim_), stream);
+    raft::copy(device_vectors_buf->data(),
+               vectors,
+               static_cast<size_t>(num_vectors) * static_cast<size_t>(dim_),
+               stream);
+    queries = device_vectors_buf->data();
   }
 
   rmm::device_uvector<algo_base::index_type> neighbors_buf(
-    static_cast<size_t>(batch_size) * static_cast<size_t>(k), stream);
+    static_cast<size_t>(num_vectors) * static_cast<size_t>(index_->graph().extent(1)), stream);
   rmm::device_uvector<float> distances_buf(
-    static_cast<size_t>(batch_size) * static_cast<size_t>(k), stream);
+    static_cast<size_t>(num_vectors) * static_cast<size_t>(index_->graph().extent(1)), stream);
   algo_base::index_type* neighbors = neighbors_buf.data();
-  float* distances                 = distances_buf.data();
+  float* distances = distances_buf.data();
 
-  if (!filter_) {
-    filter_ = std::make_shared<cuvs::neighbors::filtering::none_sample_filter>();
+  static_assert(std::is_integral_v<algo_base::index_type>);
+  static_assert(std::is_integral_v<IdxT>);
+  auto k                         = static_cast<int>(index_->graph().extent(1));
+  auto k0                       = static_cast<size_t>(refine_ratio_ * k);
+  const bool disable_refinement = k0 <= static_cast<size_t>(k);
+  const raft::resources& res    = handle_;
+  // NOTE: caching mem_type to reduce mutex locks
+  // raft::get_device_for_address call cuda API to get the pointer properties,
+  // this means it locks the context mutex for a very small amount of time.
+  // In the event of thread contention (such as thousands threads), this time can actually increase.
+  // Hence we try to bypass this check for repeated search calls.
+  thread_local MemoryType mem_type                   = MemoryType::kDevice;
+  thread_local algo_base::index_type* prev_neighbors = nullptr;
+  if (prev_neighbors != neighbors) {
+    prev_neighbors = neighbors;
+    mem_type =
+      raft::get_device_for_address(neighbors) >= 0 ? MemoryType::kDevice : MemoryType::kHostPinned;
   }
 
-  search_ex(queries, static_cast<int>(batch_size), k, neighbors, distances, nullptr);
-  raft::resource::sync_stream(handle_);
+  // If dynamic batching is used and there's no sync between benchmark laps, multiple sequential
+  // requests can group together. The data is copied asynchronously, and if the same intermediate
+  // buffer is used for multiple requests, they can override each other's data. Hence, we need to
+  // allocate as much space as required by the maximum number of sequential requests.
+  auto max_dyn_grouping = dynamic_batcher_ ? raft::div_rounding_up_safe<int64_t>(
+                                               dynamic_batching_max_batch_size_, batch_size) *
+                                               dynamic_batching_n_queues_
+                                           : 1;
+  auto tmp_buf_size =
+    ((disable_refinement ? 0 : (sizeof(float) + sizeof(algo_base::index_type)))) * batch_size * k0;
+  auto& tmp_buf = get_tmp_buffer_from_global_pool(tmp_buf_size * max_dyn_grouping);
+  thread_local static int64_t group_id = 0;
+  auto* candidates_ptr                 = reinterpret_cast<algo_base::index_type*>(
+    reinterpret_cast<uint8_t*>(tmp_buf.data(mem_type)) + tmp_buf_size * group_id);
+  group_id = (group_id + 1) % max_dyn_grouping;
+  auto* candidate_dists_ptr =
+    reinterpret_cast<float*>(candidates_ptr + (disable_refinement ? 0 : batch_size * k0));
 
+  if (disable_refinement) {
+    search_base(queries, batch_size, k, neighbors, distances);
+  } else {
+    search_base(queries, batch_size, k0, candidates_ptr, candidate_dists_ptr);
+
+    if (mem_type == MemoryType::kHostPinned && uses_stream()) {
+      // If the algorithm uses a stream to synchronize (non-persistent kernel), but the data is in
+      // the pinned host memory, we need to synchronize before the refinement operation to wait for
+      // the data being available for the host.
+      raft::resource::sync_stream(res);
+    }
+
+    auto candidate_ixs =
+      raft::make_device_matrix_view<const algo_base::index_type, algo_base::index_type>(
+        candidates_ptr, batch_size, k0);
+    auto queries_v =
+      raft::make_device_matrix_view<const T, algo_base::index_type>(queries, batch_size, dim_);
+    refine_helper(
+      res, *input_dataset_v_, queries_v, candidate_ixs, k, neighbors, distances, index_->metric());
+  }
+
+#if 0
+  // Debug: Copy first query's neighbors and distances from device to host for logging
+  if (batch_size > 0) {
+    std::vector<algo_base::index_type> host_neighbors_debug(k);
+    std::vector<float> host_distances_debug(k);
+
+    raft::copy(host_neighbors_debug.data(),
+               neighbors,
+               k,
+               raft::resource::get_cuda_stream(handle_));
+    raft::copy(host_distances_debug.data(),
+               distances,
+               k,
+               raft::resource::get_cuda_stream(handle_));
+    raft::resource::sync_stream(handle_);
+
+    RAFT_LOG_DEBUG("First query's %d nearest neighbors:", k);
+    for (int i = 0; i < std::min(k, 5); ++i) {
+      RAFT_LOG_DEBUG("  [%d] index=%u, distance=%f",
+                     i,
+                     host_neighbors_debug[i],
+                     host_distances_debug[i]);
+    }
+  }
+#endif
+
+  raft::resource::sync_stream(res);
   bool queries_on_device = raft::get_device_for_address(queries) >= 0;
+  bool neighbors_on_device = (mem_type == MemoryType::kDevice);
+  bool distances_on_device = raft::get_device_for_address(distances) >= 0;
+
   std::vector<T> host_queries(static_cast<size_t>(batch_size) * static_cast<size_t>(dim_));
   if (queries_on_device) {
     raft::copy(host_queries.data(),
                queries,
                static_cast<size_t>(batch_size) * static_cast<size_t>(dim_),
-               stream);
+               raft::resource::get_cuda_stream(res));
   } else {
     std::memcpy(host_queries.data(),
                 queries,
@@ -1037,155 +1101,177 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
 
   std::vector<algo_base::index_type> host_neighbors(static_cast<size_t>(batch_size) *
                                                     static_cast<size_t>(k));
-  raft::copy(host_neighbors.data(),
-             neighbors,
-             static_cast<size_t>(batch_size) * static_cast<size_t>(k),
-             stream);
-  raft::resource::sync_stream(handle_);
-
-  auto old_graph  = index_->graph();
-  int64_t old_rows = old_graph.extent(0);
-  int64_t cols     = old_graph.extent(1);
-  int64_t new_rows = old_rows + batch_size;
-
-  std::vector<IdxT> host_graph(static_cast<size_t>(new_rows * cols), IdxT{0});
-  if (old_rows > 0) {
-    raft::copy(host_graph.data(),
-               old_graph.data_handle(),
-               static_cast<size_t>(old_rows) * static_cast<size_t>(cols),
-               stream);
-    raft::resource::sync_stream(handle_);
+  if (neighbors_on_device) {
+    raft::copy(host_neighbors.data(),
+               neighbors,
+               static_cast<size_t>(batch_size) * static_cast<size_t>(k),
+               raft::resource::get_cuda_stream(res));
+  } else {
+    std::memcpy(host_neighbors.data(),
+                neighbors,
+                static_cast<size_t>(batch_size) * static_cast<size_t>(k) *
+                  sizeof(algo_base::index_type));
   }
 
-  int64_t dim              = static_cast<int64_t>(dim_);
-  int64_t old_dataset_rows = dataset_->extent(0);
-  int64_t old_dataset_cols = dataset_->extent(1);
-  if (old_dataset_rows != old_rows || old_dataset_cols < dim) {
-    throw std::runtime_error("Dataset storage is not aligned with graph before insert.");
-  }
 
-  int64_t total_rows = old_dataset_rows + batch_size;
-  std::vector<T> host_dataset(static_cast<size_t>(total_rows) * static_cast<size_t>(dim));
-  if (old_dataset_rows > 0) {
-    std::vector<T> host_dataset_padded(static_cast<size_t>(old_dataset_rows) *
-                                       static_cast<size_t>(old_dataset_cols));
-    raft::copy(host_dataset_padded.data(),
+  raft::resource::sync_stream(res);
+
+  // Build temporary host-backed graph with new rows inserted and serialize that temporary index.
+  {
+    auto orig_graph = index_->graph();
+    int64_t old_rows = orig_graph.extent(0);
+    int64_t cols     = orig_graph.extent(1);
+    //int64_t new_rows = old_rows + batch_size;
+
+    std::vector<IdxT> host_graph(static_cast<size_t>(old_rows * cols));
+
+    // copy existing graph into host buffer (works for host or device-backed original)
+    if (old_rows > 0) {
+      raft::copy(host_graph.data(),
+                 orig_graph.data_handle(),
+                 static_cast<size_t>(old_rows * cols),
+                 raft::resource::get_cuda_stream(handle_));
+      raft::resource::sync_stream(handle_);
+    }
+
+    // Get dataset pointer on host
+    int64_t dim = dim_;
+    int64_t old_dataset_rows = dataset_->extent(0);
+    //int64_t total_rows = old_dataset_rows + batch_size;  // Include new rows
+
+    // Copy dataset to host (if on device) and allocate space for new rows
+    std::vector<T> host_dataset(static_cast<size_t>(old_dataset_rows) * static_cast<size_t>(dim));
+    raft::copy(host_dataset.data(),
                dataset_->data_handle(),
-               static_cast<size_t>(old_dataset_rows) * static_cast<size_t>(old_dataset_cols),
-               stream);
+               static_cast<size_t>(old_dataset_rows) * static_cast<size_t>(dim),
+               raft::resource::get_cuda_stream(handle_));
     raft::resource::sync_stream(handle_);
-    for (int64_t r = 0; r < old_dataset_rows; ++r) {
-      std::memcpy(host_dataset.data() + static_cast<size_t>(r * dim),
-                  host_dataset_padded.data() + static_cast<size_t>(r * old_dataset_cols),
+
+    // --- Insert new nodes and make edges bidirectional
+    for (int64_t nRowIter = 0; nRowIter < batch_size; nRowIter++) {
+      // copy new query vector to host dataset (appending to existing dataset)
+      std::memcpy(host_dataset.data() + (size_t(ids[nRowIter]) * size_t(dim)),
+                  host_queries.data() + (size_t(nRowIter) * size_t(dim)),
                   static_cast<size_t>(dim) * sizeof(T));
-    }
-  }
 
-  // Single-thread baseline insert path.
-  for (int64_t row = 0; row < batch_size; ++row) {
-    std::memcpy(host_dataset.data() + static_cast<size_t>((old_dataset_rows + row) * dim),
-                host_queries.data() + static_cast<size_t>(row * dim),
-                static_cast<size_t>(dim) * sizeof(T));
+      // --- New adjacency update logic ------------------------------------------------------
+      int64_t new_row_id = ids[nRowIter]; // old_rows + nRowIter; // Assuming ids are sequential and start from old_rows, otherwise we need to find the correct position for each id in the new graph.
 
-    int64_t new_row_id = old_rows + row;
-    std::vector<IdxT> adjacency;
-    adjacency.reserve(static_cast<size_t>(cols));
+      // ---------------------------------------------------------
+      // 1 FORWARD EDGES: Build a clean fixed-degree row
+      // ---------------------------------------------------------
 
-    for (int j = 0; j < k && adjacency.size() < static_cast<size_t>(cols); ++j) {
-      auto nid = static_cast<IdxT>(host_neighbors[static_cast<size_t>(row) *
-                                                  static_cast<size_t>(k) +
-                                                  static_cast<size_t>(j)]);
-      auto nid_i64 = static_cast<int64_t>(nid);
-      if (nid_i64 < 0 || nid_i64 >= old_rows) { continue; }
-      if (std::find(adjacency.begin(), adjacency.end(), nid) == adjacency.end()) {
-        adjacency.push_back(nid);
+      std::vector<IdxT> vecAdjList;
+
+      // First pass: collect all candidates
+      for (int j = 0; j < k; j++) {
+        IdxT nid = neighbors_on_device ? host_neighbors[size_t(nRowIter) * k + j]
+                                        : neighbors[size_t(nRowIter) * k + j];
+
+        vecAdjList.push_back(nid);
       }
-    }
 
-    if (adjacency.empty() && old_rows > 0) { adjacency.push_back(static_cast<IdxT>(0)); }
-    while (adjacency.size() < static_cast<size_t>(cols)) {
-      adjacency.push_back(adjacency.empty() ? static_cast<IdxT>(0) : adjacency.front());
-    }
+      // ToDo: Don't padd with zeros, instead try to fill with existing neighbors of neighbors
+      // (2-hop) or even random existing nodes in the graph, to maintain better connectivity and
+      // avoid isolated nodes.
+      // Second pass: fill missing slots without applying filter (fallback)
+      if (vecAdjList.size() < size_t(cols)) {
+        vecAdjList.resize(cols, 0);
+      }
 
-    for (int64_t c = 0; c < cols; ++c) {
-      host_graph[static_cast<size_t>(new_row_id * cols + c)] = adjacency[static_cast<size_t>(c)];
-    }
+      // Write compact adjacency (NO HOLES)
+      for (int j = 0; j < cols; j++) {
+        host_graph[new_row_id * cols + j] = vecAdjList[j];
+      }
 
-    bool inserted_any = false;
-    for (IdxT nid : adjacency) {
-      auto nid_i64 = static_cast<int64_t>(nid);
-      if (nid_i64 < 0 || nid_i64 >= old_rows || nid_i64 == new_row_id) { continue; }
+      // ---------------------------------------------------------
+      // 2 REVERSE EDGES: Common-neighbour based rewiring
+      // ---------------------------------------------------------
+      bool inserted_any = false;
 
-      bool already_present = false;
-      for (int64_t c = 0; c < cols; ++c) {
-        if (host_graph[static_cast<size_t>(nid_i64 * cols + c)] == static_cast<IdxT>(new_row_id)) {
-          already_present = true;
-          break;
+      for (IdxT nid : vecAdjList) {
+        if (nid >= old_rows || nid == new_row_id) continue;
+
+        // Check if nid already links to new_row_id
+        bool already_present = false;
+        for (int64_t j = 0; j < cols; j++) {
+          if (host_graph[nid * cols + j] == new_row_id) {
+            already_present = true;
+            break;
+          }
+        }
+        if (already_present) continue;
+
+        IdxT replace_candidate;
+        if (!has_common_neighbour(
+              nid, new_row_id, host_graph, cols, old_rows, replace_candidate))
+          continue;
+
+        // Replace the common neighbor with new_row_id
+        for (int64_t j = 0; j < cols; j++) {
+          if (host_graph[nid * cols + j] == replace_candidate) {
+            host_graph[nid * cols + j] = new_row_id;
+            inserted_any = true;
+            break;
+          }
         }
       }
-      if (already_present) { continue; }
 
-      IdxT replace_candidate{};
-      if (!has_common_neighbour(
-            static_cast<IdxT>(nid_i64), static_cast<IdxT>(new_row_id), host_graph, cols, new_rows, replace_candidate)) {
-        continue;
+      // Fallback safety: ensure at least one reverse edge to the newly inserted point
+      if (!inserted_any && !vecAdjList.empty()) {
+        IdxT nid = vecAdjList[0];
+        host_graph[nid * cols + 0] = new_row_id;
       }
+    }  // For loop on each query
 
-      for (int64_t c = 0; c < cols; ++c) {
-        if (host_graph[static_cast<size_t>(nid_i64 * cols + c)] == replace_candidate) {
-          host_graph[static_cast<size_t>(nid_i64 * cols + c)] = static_cast<IdxT>(new_row_id);
-          inserted_any = true;
-          break;
-        }
+    // copy the host dataset with new vectors back to device (if original dataset was on device)
+    if (raft::get_device_for_address(dataset_->data_handle()) >= 0) {
+      if (dataset_->extent(0) != old_dataset_rows || dataset_->extent(1) != dim) {
+        *dataset_ = raft::make_device_matrix<T, int64_t>(handle_, old_dataset_rows, dim);
       }
+      raft::copy(dataset_->data_handle(),
+                 host_dataset.data(),
+                 static_cast<size_t>(old_dataset_rows) * static_cast<size_t>(dim),
+                 raft::resource::get_cuda_stream(handle_));
+      raft::resource::sync_stream(handle_);
+      index_->update_dataset(handle_, make_const_mdspan(dataset_->view()));
     }
 
-    if (!inserted_any && !adjacency.empty()) {
-      auto nid_i64 = static_cast<int64_t>(adjacency.front());
-      if (nid_i64 >= 0 && nid_i64 < old_rows) {
-        host_graph[static_cast<size_t>(nid_i64 * cols)] = static_cast<IdxT>(new_row_id);
+    // copy the updated host graph with new rows back to device (if original graph was on device)
+    if (raft::get_device_for_address(index_->graph().data_handle()) >= 0) {
+      if (graph_->extent(0) != old_rows || graph_->extent(1) != cols) {
+        *graph_ = raft::make_device_matrix<IdxT, int64_t>(handle_, old_rows, cols);
       }
+      raft::copy(graph_->data_handle(),
+                 host_graph.data(),
+                 static_cast<size_t>(old_rows) * static_cast<size_t>(cols),
+                 raft::resource::get_cuda_stream(handle_));
+      raft::resource::sync_stream(handle_);
+      index_->update_graph(handle_, make_const_mdspan(graph_->view()));
     }
-  }
 
-  auto host_dataset_view = raft::make_host_matrix_view<const T, int64_t, raft::row_major>(
-    host_dataset.data(), total_rows, dim);
-  auto dataset_mr = get_mr(dataset_mem_);
-  cuvs::neighbors::cagra::detail::copy_with_padding(handle_, *dataset_, host_dataset_view, dataset_mr);
-  auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
-    dataset_->data_handle(), dataset_->extent(0), this->dim_, dataset_->extent(1));
-  index_->update_dataset(handle_, dataset_view);
+    // log the size of the updated graph and dataset for debugging
+    std::cout << "Updated graph size: " << old_rows << " rows x " << cols << " cols\n";
+    std::cout << "Updated dataset size: " << old_dataset_rows << " rows x " << dim << " cols\n";
+    #if 0
+    // if the persist flag is set, serialize the updated index back to disk (overwriting original)
+    if (persist_insert_) {
+      // dont hardcode the path here, instead use the original path from which the index was loaded (graph_file_)
+      std::string file =
+        (graph_file_ && !graph_file_->empty()) ? *graph_file_ : "cuvs_cagra_updated.graph";
 
-  auto graph_mr = get_mr(graph_mem_);
-  *graph_       = raft::make_device_mdarray<IdxT, int64_t>(
-    handle_, graph_mr, raft::make_extents<int64_t>(new_rows, cols));
-  raft::copy(graph_->data_handle(),
-             host_graph.data(),
-             static_cast<size_t>(new_rows) * static_cast<size_t>(cols),
-             stream);
-  raft::resource::sync_stream(handle_);
-  index_->update_graph(handle_, make_const_mdspan(graph_->view()));
+      cuvs::neighbors::cagra::serialize(handle_, file, *index_, false);
+      std::cout << "\n [INFO] Serialized updated CAGRA index to disk after insert." << std::endl;
+    } 
+    #endif
+  }  // end of INSERT block
 
-  *input_dataset_v_ = raft::make_device_matrix_view<const T, int64_t>(
-    dataset_->data_handle(), dataset_->extent(0), this->dim_);
-  need_dataset_update_ = false;
-  has_inserted_data_   = true;
-
-  if (insert_params_.persist && graph_file_.has_value() && !graph_file_->empty()) {
-    save(*graph_file_);
-    std::cout << "[insert-single] persisted updated index to " << *graph_file_ << std::endl;
-  }
-
-  std::cout << "[insert-single] complete: old_rows=" << old_rows
-            << " inserted=" << batch_size
-            << " new_rows=" << new_rows
-            << " graph_cols=" << cols
-            << " dataset_rows=" << dataset_->extent(0) << std::endl;
 }
 
-#else
+#endif
+#if 0
 template <typename T, typename IdxT>  
-void cuvs_cagra<T, IdxT>::insert_wait(const T* vectors, size_t num_vectors, const uint64_t* ids)
+void cuvs_cagra<T, IdxT>::insert_old(const T* vectors, size_t num_vectors, const uint64_t* ids)
 {
   (void)ids;
   if (num_vectors == 0) { return; }
@@ -1976,8 +2062,9 @@ void cuvs_cagra<T, IdxT>::search_ex(
   raft::copy(graph_host.data(), graph_view.data_handle(), graph_rows * graph_cols, raft::resource::get_cuda_stream(handle_));
    raft::resource::sync_stream(handle_);
   // print graph dimensions for debugging
+#ifdef KVDEBUG  
   std::cout << "[search] graph dimensions: rows=" << graph_rows << " cols=" << graph_cols << std::endl;     
-  
+#endif
   for (int64_t r = 0; r < graph_rows; ++r)  {
       for (int64_t c = 0; c < graph_cols; ++c) {
           auto neighbor_id = graph_host[r * graph_cols + c];
@@ -2124,6 +2211,7 @@ void cuvs_cagra<T, IdxT>::search_ex(
       }
     }
   }
+  #if 0
   // print first k neighbours and distances of first and second query for debugging
   {
     constexpr std::size_t kDebugTopN = 10;
@@ -2173,5 +2261,6 @@ void cuvs_cagra<T, IdxT>::search_ex(
       }
     }
   }
+  #endif
 }
 }  // namespace cuvs::bench
