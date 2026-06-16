@@ -569,32 +569,12 @@ void FreshBANG<T>::BatchedSearch(
     static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(user_search_params_.recall_at_k);
   std::vector<cuvs::bench::algo_base::index_type> neighbors64(result_count, 0);
 
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::cerr << "[FreshBANG::BatchedSearch] Error: cudaDeviceSynchronize failed before "
-                 "timing search_ex."
-              << std::endl;
-    return;
-  }
-
-  const auto search_t0 = std::chrono::steady_clock::now();
   algo_obj->search_ex(search_queries,
                       static_cast<int>(batch_size),
                       static_cast<int>(user_search_params_.recall_at_k),
                       neighbors64.data(),
                       distances,
                       reinterpret_cast<int64_t*>(ids));
-  if (cudaDeviceSynchronize() != cudaSuccess) {
-    std::cerr << "[FreshBANG::BatchedSearch] Error: cudaDeviceSynchronize failed after "
-                 "search_ex."
-              << std::endl;
-    return;
-  }
-
-  const auto search_t1 = std::chrono::steady_clock::now();
-  const auto elapsed_sec = std::chrono::duration<double>(search_t1 - search_t0).count();
-  const auto qps = (elapsed_sec > 0.0) ? (static_cast<double>(batch_size) / elapsed_sec) : 0.0;
-  std::cout << "[FreshBANG::BatchedSearch] search_ex_only elapsed_sec=" << elapsed_sec
-            << " qps=" << qps << std::endl;
 
   for (std::size_t i = 0; i < result_count; ++i) {
     const auto n = neighbors64[i];
@@ -682,7 +662,7 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
 {
   std::cout << "[FreshBANG::BatchedInsert] batch_size=" << batch_size
             << " insertvectors=" << static_cast<const void*>(insertvectors)
-            << " ids=" << static_cast<const void*>(ids) << std::endl;
+            << " ids=" << ids[0] << " to " << ids[batch_size - 1] << std::endl;
 
   if (m_pImpl == nullptr) {
     std::cerr << "[FreshBANG::BatchedInsert] Error: CreateAlgo() must be called before "
@@ -784,7 +764,7 @@ template <typename T>
 void FreshBANG<T>::BatchedDelete(const uint64_t* ids, uint32_t batch_size)
 {
   std::cout << "[FreshBANG::BatchedDelete] batch_size=" << batch_size
-            << " ids=" << static_cast<const void*>(ids) << std::endl;
+            << " ids=" << ids[0] << " to " << ids[batch_size - 1] << std::endl;
 
   if (m_pImpl == nullptr) {
     std::cerr << "[FreshBANG::BatchedDelete] Error: CreateAlgo() must be called before "

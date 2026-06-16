@@ -73,6 +73,11 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
 
   if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
 
+  // Mark this row as live (not deleted) now that it is being inserted.
+  // Only one thread per block needs to do this write.
+  if (col_idx == 0) { params.deleted_rows[cur_row] = 0; }
+  __syncthreads();
+
   // First Step: copy d_insert_vectors to the appropriate location in the dataset 
   uint32_t dims_per_thread =  (vector_dim + blockDim.x - 1) / blockDim.x; // ceiling division to cover all dimensions
 
@@ -82,13 +87,22 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
   }
 
   // Second Step: Update the adjacency list for the current row with the search neighbors returned by the search kernel and mark the distance thresholds for this row based on the search distances returned by the search kernel.
-  params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] =
-                         d_search_neighbors[(row_idx * recall_at_k) + col_idx]; // update adjacency list with search neighbors
+  {
+    auto nbr_val = d_search_neighbors[(row_idx * recall_at_k) + col_idx];
+    // Only write valid neighbor IDs; skip CAGRA sentinels (UINT32_MAX) and out-of-range values.
+    if (nbr_val >= 0 && nbr_val < params.graph_rows) {
+      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] =
+        static_cast<uint32_t>(nbr_val);
+    }
+  }
   
   
   // Third Step: for each neighbor identify the neighbors
   // Mental mode of graph: row#|neighbor1 neighbor2 neighbor3 ...
   auto cur_row_cur_neighbor = params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx];
+  // Guard against CAGRA sentinel values (e.g. UINT32_MAX) that can appear when
+  // the search cannot fill all k slots (graph degradation after concurrent inserts).
+  if (static_cast<int64_t>(cur_row_cur_neighbor) >= params.graph_rows) { return; }
   for (int64_t col = 0; col < params.graph_cols; col++) {
     auto neighbor_of_cur_row_cur_neighbor = params.graph[(cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col];
     // scan the neighbours of cur_row
@@ -155,7 +169,7 @@ __global__ void cuvs_bang_delete_kernel1(DeleteKernelParams params)
 {
   // Print graph dimensions once from thread 0 and also first and last row_num to be deleted
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    printf("[bang_kernel] graph_rows=%lld graph_cols=%lld num_ids=%llu first_row=%llu last_row=%llu\n",
+    printf("[bang_delete_kernel] graph_rows=%lld graph_cols=%lld num_ids=%llu first_row=%llu last_row=%llu\n",
            (long long)params.graph_rows, (long long)params.graph_cols, (unsigned long long)params.num_ids,
            (unsigned long long)params.row_num[0], (unsigned long long)params.row_num[params.num_ids - 1]);
   }

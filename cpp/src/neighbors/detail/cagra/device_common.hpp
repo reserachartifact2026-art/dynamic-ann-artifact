@@ -169,7 +169,7 @@ RAFT_DEVICE_INLINE_FUNCTION void compute_distance_to_random_nodes(
 
       // Deleted node filteration
       // Invalidate deleted rows by setting distance to upper bound sentinel
-      #if 0
+      #if 1
       if (deleted_rows_ptr && result_indices_ptr[i] != raft::upper_bound<IndexT>() &&
           deleted_rows_ptr[result_indices_ptr[i]] == 1) {
         // log the deleted index and thread adn block ids for debugging
