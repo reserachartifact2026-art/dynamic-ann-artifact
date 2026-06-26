@@ -217,7 +217,7 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
     return 1;
   }
 
-  std::cout << "[freshbang_driver] BuildIndex(rows=1000 out of " << base_blob.n_rows()
+  std::cout << "[freshbang_driver] BuildIndex(rows= " << base_blob.n_rows()
             << ", cols=" << base_blob.n_cols() << ")" << std::endl;
   if (!freshbang.BuildIndex(base_blob.data(), base_blob.n_rows())) {
     std::cerr << "[freshbang_driver] BuildIndex failed" << std::endl;

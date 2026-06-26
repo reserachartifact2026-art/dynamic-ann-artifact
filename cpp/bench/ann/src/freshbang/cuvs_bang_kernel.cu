@@ -35,6 +35,22 @@ namespace cuvs::bench::detail {
     float* d_distance_threshold2; // to be used for insertions  
   } InsertKernelParams;
 
+__device__ __forceinline__ bool is_row_in_insert_batch(const InsertKernelParams& params,
+                                                        uint64_t row)
+{
+  for (size_t i = 0; i < params.num_ids; ++i) {
+    if (params.row_num[i] == row) { return true; }
+  }
+  return false;
+}
+
+__device__ __forceinline__ bool is_invalid_or_deleted_neighbor(const InsertKernelParams& params,
+                                                               uint32_t neighbor)
+{
+  if (static_cast<int64_t>(neighbor) >= params.graph_rows) { return true; }
+  return params.deleted_rows[neighbor] == 1;
+}
+
  template<typename T>
 __global__ void cuvs_bang_insert_kernel1(InsertKernelParams params, 
                                         T* d_insert_vectors,
@@ -72,11 +88,10 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
   auto cur_row = params.row_num[row_idx];
 
   if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
-
+  if (col_idx >= static_cast<uint64_t>(params.graph_cols)) { return; }
   // Mark this row as live (not deleted) now that it is being inserted.
   // Only one thread per block needs to do this write.
-  if (col_idx == 0) { params.deleted_rows[cur_row] = 0; }
-  __syncthreads();
+ 
 
   // First Step: copy d_insert_vectors to the appropriate location in the dataset 
   uint32_t dims_per_thread =  (vector_dim + blockDim.x - 1) / blockDim.x; // ceiling division to cover all dimensions
@@ -91,18 +106,61 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
     auto nbr_val = d_search_neighbors[(row_idx * recall_at_k) + col_idx];
     // Only write valid neighbor IDs; skip CAGRA sentinels (UINT32_MAX) and out-of-range values.
     if (nbr_val >= 0 && nbr_val < params.graph_rows) {
-      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] =
-        static_cast<uint32_t>(nbr_val);
+      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] = 
+       static_cast<uint32_t>(nbr_val);
+    }
+    else
+    {
+      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] = 0; // or some other default value indicating no neighbor
     }
   }
   
-  
+  #if 1
   // Third Step: for each neighbor identify the neighbors
   // Mental mode of graph: row#|neighbor1 neighbor2 neighbor3 ...
+  for (int64_t col = static_cast<int64_t>(col_idx); col < params.graph_cols;
+       col += static_cast<int64_t>(blockDim.x)) {
+    auto cur_row_cur_neighbor = params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col];
+    // Guard against CAGRA sentinel values (e.g. UINT32_MAX) that can appear when
+    // the search cannot fill all k slots (graph degradation after concurrent inserts).
+    if (static_cast<int64_t>(cur_row_cur_neighbor) >= params.graph_rows) { continue; }
+    // Do not update rows that are also being inserted in this launch.
+    if (is_row_in_insert_batch(params, static_cast<uint64_t>(cur_row_cur_neighbor))) { continue; }
+    bool reverse_edge_added = false;
+    for (int64_t col2 = 0; col2 < params.graph_cols; col2++) {
+      auto neighbor_of_cur_row_cur_neighbor =
+        params.graph[(cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col2];
+      // scan the neighbours of cur_row
+      for (int64_t entry = 0; entry < params.graph_cols; entry++) {
+        if (params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + entry] == 
+        neighbor_of_cur_row_cur_neighbor) {
+          auto target_offset = (cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col2;
+          //auto old_val       = params.graph[target_offset];
+          // Preserve existing valid edges; only backfill empty/stale slots.
+          //if (is_invalid_or_deleted_neighbor(params, old_val)) 
+          {
+            params.graph[target_offset] =
+              cur_row;  // add cur_row as a neighbor to the neighbors of cur_row's neighbors
+            reverse_edge_added = true;
+            break;
+          }
+        }
+      }
+      if (reverse_edge_added) { break; } // no need to continue scanning cur_row_cur_neighbor if reverse edge is added
+    }
+  }
+  #endif
+  //__syncthreads();
+   if (col_idx == 0) { params.deleted_rows[cur_row] = 0; }
+  //__syncthreads();
+
+  #if 0
   auto cur_row_cur_neighbor = params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx];
   // Guard against CAGRA sentinel values (e.g. UINT32_MAX) that can appear when
   // the search cannot fill all k slots (graph degradation after concurrent inserts).
   if (static_cast<int64_t>(cur_row_cur_neighbor) >= params.graph_rows) { return; }
+  // Do not update rows that are also being inserted in this launch.
+  if (is_row_in_insert_batch(params, static_cast<uint64_t>(cur_row_cur_neighbor))) { return; }
   for (int64_t col = 0; col < params.graph_cols; col++) {
     auto neighbor_of_cur_row_cur_neighbor = params.graph[(cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col];
     // scan the neighbours of cur_row
@@ -113,6 +171,7 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
       }
     }        
 }
+#endif
 }  
 
 
@@ -148,21 +207,25 @@ void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
   auto blocks      = static_cast<uint32_t>(num_ids);
 
   // copy the h_insert_vectrs to device
+  #if 1
   T* d_insert_vectors;
+  
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_insert_vectors), num_ids * vector_dim * sizeof(T)));
   RAFT_CUDA_TRY(cudaMemcpy(d_insert_vectors, h_insert_vectors, num_ids * vector_dim * sizeof(T), cudaMemcpyHostToDevice));
 
   cuvs_bang_insert_kernel1<<<blocks, threads>>>(params, d_insert_vectors,d_dataset_vectors, 
     vector_dim, recall_at_k, d_search_neighbors, d_search_distances );
-  //cuvs_bang_insert_kernel2<<<blocks, threads>>>(d_insert_vectors, params);
+  
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
 
-  std::printf("[bang] insert kernel processed=%zu ids\n", num_ids);
-
+  
   RAFT_CUDA_TRY(cudaFree(params.row_num));  
   RAFT_CUDA_TRY(cudaFree(d_insert_vectors));
+  #endif
+
+  std::printf("[bang] insert kernel processed=%zu ids\n", num_ids);
 }
 
 __global__ void cuvs_bang_delete_kernel1(DeleteKernelParams params)
@@ -214,7 +277,7 @@ __global__ void cuvs_bang_delete_kernel2(DeleteKernelParams params)
     for (int64_t col = 0; col < params.graph_cols; col++) {
       auto neighbor = params.graph[row * static_cast<uint64_t>(params.graph_cols) + col];
       if (neighbor == cur_row) {
-        for (uint32_t temp_iter = 0; temp_iter < params.graph_cols; temp_iter++){
+        //for (uint32_t temp_iter = 0; temp_iter < params.graph_cols; temp_iter++){
         uint32_t cur_row_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + circular_counter];
         if (params.deleted_rows[cur_row_neighbour] != 1){
           // Replace the deleted-node reference with a live neighbor from the deleted row.
@@ -224,14 +287,14 @@ __global__ void cuvs_bang_delete_kernel2(DeleteKernelParams params)
         } else {
             if (++circular_counter >= params.graph_cols ) circular_counter = 0;
         }
-      }
+      //}
        
       
       } // end if neighbor match
     }  // end for cols  
   } // end for rows
 
-    
+    #if 0
       uint32_t temp_iter = 0;
       while (temp_iter++ < params.graph_cols-1) {
         uint32_t cur_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + temp_iter];
@@ -248,7 +311,7 @@ __global__ void cuvs_bang_delete_kernel2(DeleteKernelParams params)
           break;
         }
       } // end while
-    
+    #endif
 }
 
 

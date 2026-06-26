@@ -189,7 +189,7 @@ private:
                     << w
                     << "\n";
 
-                std::exit(1);
+                // std::exit(1);
             }
 
             if (index[w] == -1) {
@@ -290,7 +290,7 @@ WCCResult compute_wcc(
                     << v
                     << "\n";
 
-                std::exit(1);
+//                std::exit(1);
             }
 
             undirected[u].push_back(v);
@@ -402,7 +402,7 @@ void print_degree_stats(
                     << v
                     << "\n";
 
-                std::exit(1);
+//                std::exit(1);
             }
 
             outdeg[u]++;

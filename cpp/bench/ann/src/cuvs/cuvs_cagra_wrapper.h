@@ -144,7 +144,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
     sizeof(float) * initial_rows, handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
 
   }
-
+// legacy constructor used by cuvs benchmark flow
   cuvs_cagra(Metric metric, int dim, const build_param& param, int concurrent_searches = 1)
     : cuvs_cagra(metric, 0, dim, param, concurrent_searches)
   {
@@ -640,7 +640,8 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
 
   auto stream              = raft::resource::get_cuda_stream(handle_);
   const auto expected_rows = rows_ > 0 ? static_cast<size_t>(build_rows_) : size_t{0};
-  if (expected_rows != 0 && nrow != expected_rows) { // relaxed the check when running as EXE (CUVS_CAGRA_ANN_BENCH , legacy flow)
+  // I want dataset to be atleast the size of the build index
+  if (expected_rows != 0 && nrow < expected_rows) { // relaxed the check when running as EXE (CUVS_CAGRA_ANN_BENCH , legacy flow rows_ = 0)
     // log error
     throw std::runtime_error(
       "set_search_dataset: search dataset row count (" + std::to_string(nrow) +
@@ -650,6 +651,7 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
   auto old_graph   = index_->graph();
   auto old_rows    = old_graph.extent(0);
   auto cols        = old_graph.extent(1);
+  // Max rows that should be supported 
   auto target_rows = static_cast<int64_t>(rows_);
 
   // Keep any host-side expansion buffer alive for the full function scope.
@@ -758,9 +760,26 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
     if (old_rows > 0) {
       raft::copy(
         new_expanded_graph.data_handle(), old_graph.data_handle(), old_graph.size(), stream);
-      raft::resource::sync_stream(handle_);
-
     }
+
+    // Zero-initialize the tail rows [old_rows, target_rows).
+    // raft::make_device_mdarray does NOT zero-initialize, so without this the tail
+    // contains garbage neighbor IDs.  When CAGRA search traverses those IDs it
+    // computes distances against invalid dataset addresses → OOB illegal access.
+    auto tail_offset = static_cast<size_t>(old_rows) * static_cast<size_t>(cols);
+    auto tail_elems  = static_cast<size_t>(target_rows - old_rows) * static_cast<size_t>(cols);
+    if (tail_elems > 0) {
+      RAFT_CUDA_TRY(cudaMemsetAsync(
+        new_expanded_graph.data_handle() + tail_offset,
+        0,
+        tail_elems * sizeof(IdxT),
+        stream));
+    }
+    raft::resource::sync_stream(handle_);
+
+    std::cout << "[set_search_dataset] expanded graph: old_rows=" << old_rows
+              << " target_rows=" << target_rows << " cols=" << cols
+              << " zeroed_tail_elems=" << tail_elems << std::endl;
 
     *graph_ = std::move(new_expanded_graph);
     index_->update_graph(handle_, make_const_mdspan(graph_->view()));
@@ -1411,8 +1430,6 @@ void cuvs_cagra<T, IdxT>::insert_old(const T* vectors, size_t num_vectors, const
 template <typename T, typename IdxT>  
 void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uint64_t* ids)
 {
-
- 
   if (num_vectors == 0) { return; }
   if (vectors == nullptr) {
     throw std::runtime_error("insert requires a non-null vectors pointer when num_vectors > 0");
@@ -1435,6 +1452,8 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
   auto stream = raft::resource::get_cuda_stream(handle_);
   bool vectors_on_device = raft::get_device_for_address(vectors) >= 0;
 
+  auto start = std::chrono::high_resolution_clock::now();
+
   // copy vectors to device if they are not already there, 
   std::unique_ptr<rmm::device_uvector<T>> device_vectors_buf;
   const T* queries = vectors;
@@ -1448,7 +1467,11 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
     queries = device_vectors_buf->data();
   }
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration_ms = end - start;
+  std::cout << "[insert] Copying vectors from host to device took " << duration_ms.count() << " ms for "  << num_vectors << " vectors." << std::endl;
 
+  start = std::chrono::high_resolution_clock::now(); 
   auto graph_view = index_->graph();
   if (graph_view.extent(0) == 0) {
     std::cout << "[insert] graph is empty, delegating to build()" << std::endl;
@@ -1487,6 +1510,9 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
     throw std::runtime_error("Index graph has zero out-degree; cannot derive insert neighbors.");
   }
 
+  end = std::chrono::high_resolution_clock::now();
+  duration_ms = end - start;
+  std::cout << "[insert] validations took " << duration_ms.count() << " ms for " << batch_size << " queries." << std::endl;
 
   rmm::device_uvector<algo_base::index_type> neighbors_buf(
     static_cast<size_t>(batch_size) * static_cast<size_t>(k), stream);
@@ -1500,7 +1526,8 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
   if (!filter_) {
     filter_ = std::make_shared<cuvs::neighbors::filtering::none_sample_filter>();
   }
-
+// mesure the time taken for search_ex
+  start = std::chrono::high_resolution_clock::now(); 
   search_ex(queries, // on device
             static_cast<int>(batch_size),
             k,
@@ -1508,7 +1535,36 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
             distances, // on device
             nullptr);
   raft::resource::sync_stream(handle_);
+  end = std::chrono::high_resolution_clock::now();
+  duration_ms = end - start;
+  std::cout << "[insert] search_ex took " << duration_ms.count() << " ms for " << batch_size << " queries." << std::endl;
 
+#if 0
+// debugging 
+// for queries 500000 to 500,100 verify if the retrieved neighbors are < 5000,0000
+// copy returned neighbors to host 
+   std::vector<algo_base::index_type> host_neighbors(static_cast<size_t>(batch_size) *
+                                                     static_cast<size_t>(k));
+  raft::copy(host_neighbors.data(), neighbors, static_cast<size_t>(batch_size) * static_cast<size_t>(k), stream);
+  raft::resource::sync_stream(handle_);
+  
+// scan the host_neighbors and check if any neighbor is >= 5000000
+  for (int64_t i = 0; i < 10; ++i) {
+    for (int j = 0; j < k; ++j) {
+
+      // print the ids and the corresponding neighbors for the first 10 queries
+      std::printf("[insert] query_id123=%llu neighbor[%d]=%u\n",
+                  static_cast<unsigned long long>(ids[i]),
+                  j,
+                  static_cast<unsigned>(host_neighbors[i * k + j]));
+      /*if (host_neighbors[i * k + j] >= 500000) {
+        std::cerr << "[insert] Error: neighbor " << host_neighbors[i * k + j]
+                  << " for query " << i << " is out of bounds." << std::endl;*/
+    }
+  } 
+#endif
+
+  
   //auto graph_view = index_->graph();
   auto* graph_ptr = reinterpret_cast<const uint32_t*>(graph_view.data_handle());
   auto graph_rows = graph_view.extent(0);
@@ -1530,6 +1586,7 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
     (long long)cached_graph_rows,
     (long long)cached_graph_cols,
     (const void*)dataset_ptr);
+ 
   detail::launch_cuvs_bang_insert_kernel(ids,
                                          num_vectors,
                                          graph_ptr,
@@ -1545,346 +1602,6 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
                                         distances,
                                         k);
 
- #if 0
-  bool queries_on_device = raft::get_device_for_address(queries) >= 0;
-  std::vector<T> host_queries(static_cast<size_t>(batch_size) * static_cast<size_t>(dim_));
-  if (queries_on_device) {
-    raft::copy(host_queries.data(),
-               queries,
-               static_cast<size_t>(batch_size) * static_cast<size_t>(dim_),
-               stream);
-  } else {
-    std::memcpy(host_queries.data(),
-                queries,
-                static_cast<size_t>(batch_size) * static_cast<size_t>(dim_) * sizeof(T));
-  }
-
-  std::vector<algo_base::index_type> host_neighbors(static_cast<size_t>(batch_size) *
-                                                    static_cast<size_t>(k));
-  raft::copy(host_neighbors.data(),
-             neighbors,
-             static_cast<size_t>(batch_size) * static_cast<size_t>(k),
-             stream);
-  raft::resource::sync_stream(handle_);
-
-  auto old_graph  = index_->graph();
-  int64_t old_rows = old_graph.extent(0);
-  int64_t cols     = old_graph.extent(1);
-  //int64_t new_rows = old_rows + batch_size;
-
-  std::vector<IdxT> host_graph(static_cast<size_t>(new_rows * cols), IdxT{0});
-  if (old_rows > 0) {
-    raft::copy(host_graph.data(),
-               old_graph.data_handle(),
-               static_cast<size_t>(old_rows * cols),
-               stream);
-    raft::resource::sync_stream(handle_);
-  }
-
-  int64_t dim = static_cast<int64_t>(dim_);
-  int64_t old_dataset_rows = dataset_->extent(0);
-  int64_t old_dataset_cols = dataset_->extent(1);
-  if (old_dataset_rows != old_rows || old_dataset_cols < dim) {
-    throw std::runtime_error("Dataset storage is not aligned with graph before insert.");
-  }
-
-  // copy old dataset to host
-  int64_t total_rows = old_dataset_rows ;
-  std::vector<T> host_dataset(static_cast<size_t>(total_rows) * static_cast<size_t>(dim));
-  if (old_dataset_rows > 0) {
-    std::vector<T> host_dataset_padded(static_cast<size_t>(old_dataset_rows) *
-                                       static_cast<size_t>(old_dataset_cols));
-    raft::copy(host_dataset_padded.data(),
-               dataset_->data_handle(),
-               static_cast<size_t>(old_dataset_rows) * static_cast<size_t>(old_dataset_cols),
-               stream);
-    raft::resource::sync_stream(handle_);
-    for (int64_t r = 0; r < old_dataset_rows; ++r) {
-      std::memcpy(host_dataset.data() + static_cast<size_t>(r * dim),
-                  host_dataset_padded.data() + static_cast<size_t>(r * old_dataset_cols),
-                  static_cast<size_t>(dim) * sizeof(T));
-    }
-  }
-
-  // Per-row adjacency lists computed in Phase 1 and consumed in Phase 2.
-  std::vector<std::vector<IdxT>> per_row_adjacency(static_cast<size_t>(batch_size));
-
-  // ---------------------------------------------------------------
-  // Phase 1 (fully parallel): dataset copy + forward edge wiring
-  //
-  // Safe because every thread writes to a unique region:
-  //   host_dataset: offset (id[row])*dim  — unique per row
-  //   host_graph:   row  new_row_id = old_rows+row     — unique per row
-  // ---------------------------------------------------------------
-#pragma omp parallel for schedule(static)
-  for (int64_t row = 0; row < batch_size; ++row) {
-    // copy the basedataset 
-    std::memcpy(host_dataset.data() + static_cast<size_t>((id[row]) * dim),
-                host_queries.data() + static_cast<size_t>(row * dim),
-                static_cast<size_t>(dim) * sizeof(T));
-
-    //int64_t new_row_id = old_rows + row;
-    // Set this row as not deleted
-    RAFT_CUDA_TRY(cudaMemsetAsync(
-      (uint8_t*)d_deleted_rows_->data()+(id[row]), 0, 1, handle_.get_sync_stream()));
-    
-    std::vector<IdxT> adjacency;
-    adjacency.reserve(static_cast<size_t>(cols));
-
-    for (int j = 0; j < k && adjacency.size() < static_cast<size_t>(cols); ++j) {
-      auto nid = static_cast<IdxT>(host_neighbors[(static_cast<size_t>(row) * static_cast<size_t>(k)) +
-                                                  static_cast<size_t>(j)]);
-      auto nid_i64 = static_cast<int64_t>(nid);
-      if (nid_i64 < 0 || nid_i64 >= old_rows) { continue; }
-      // copy d_deleted_rows_ to host and check if the neighbor is marked as deleted
-      uint8_t deleted_flag = 1;
-      RAFT_CUDA_TRY(cudaMemcpyAsync(&deleted_flag,
-                                     (uint8_t*)d_deleted_rows_->data() + nid,
-                                     1,
-                                     cudaMemcpyDeviceToHost,
-                                     handle_.get_sync_stream()));
-      RAFT_CUDA_TRY(cudaStreamSynchronize(handle_.get_sync_stream()));
-      if (deleted_flag  == 1)
-      {
-        // log an error message here, as this should not happen ideally.
-        std::cerr << "[cuvs_cagra_wrapper] Encountered deleted neighbor: " << nid << " for row: "
-        << id[static_cast<size_t>(row)] << std::endl;
-        continue;  // skip deleted neighbor
-      }
-      bool exists = std::find(adjacency.begin(), adjacency.end(), nid) != adjacency.end();
-      if (!exists) { adjacency.push_back(nid); }
-    }
-    // collected the neighbours of the newly inserted vector
-
-    if (adjacency.empty() && old_rows > 0) { adjacency.push_back(static_cast<IdxT>(0)); }
-
-    // padded the adjacency list to have fixed size of cols (out degree)
-    while (adjacency.size() < static_cast<size_t>(cols)) {
-      adjacency.push_back(adjacency.empty() ? static_cast<IdxT>(0) : adjacency.front());
-    }
-
-    for (int64_t c = 0; c < cols; ++c) {
-      host_graph[static_cast<size_t>(new_row_id * cols + c)] = adjacency[static_cast<size_t>(c)];
-    }
-
-    per_row_adjacency[static_cast<size_t>(row)] = std::move(adjacency);
-  }  // end Phase 1
-
-  // ---------------------------------------------------------------
-  // Phase 2 (naive lock-free): each inserted row updates its own
-  // local copy of old rows, then we merge old rows by selecting one
-  // row-local version per old row.
-  // ---------------------------------------------------------------
-  std::vector<IdxT> host_graph_old(static_cast<size_t>(old_rows * cols));
-  if (old_rows > 0) {
-    std::copy(host_graph.begin(),
-              host_graph.begin() + static_cast<size_t>(old_rows * cols),
-              host_graph_old.begin());
-  }
-
-  std::vector<std::vector<IdxT>> row_local_old_graphs(static_cast<size_t>(batch_size),
-                                                       host_graph_old);
-  std::vector<std::vector<char>> row_old_row_touched(
-    static_cast<size_t>(batch_size), std::vector<char>(static_cast<size_t>(old_rows), 0));
-
-#pragma omp parallel for schedule(dynamic)
-  for (int64_t row = 0; row < batch_size; ++row) {
-    auto& local_graph = row_local_old_graphs[static_cast<size_t>(row)];
-    auto& row_touched = row_old_row_touched[static_cast<size_t>(row)];
-
-    int64_t new_row_id    = old_rows + row;
-    // lookup adjacency of the newly inserted row
-    const auto& adjacency = per_row_adjacency[static_cast<size_t>(row)];
-    bool inserted_any     = false;
-
-    for (auto nid : adjacency) {
-      int64_t nid_i64 = static_cast<int64_t>(nid);
-      if (nid_i64 < 0 || nid_i64 >= old_rows || nid_i64 == new_row_id) { continue; }
-
-      bool already_present = false;
-      for (int64_t c = 0; c < cols; ++c) {
-        if (local_graph[static_cast<size_t>(nid_i64 * cols + c)] == static_cast<IdxT>(new_row_id)) {
-          already_present = true;
-          break;
-        }
-      }
-      if (already_present) { continue; }
-
-      IdxT replace_candidate{};
-      bool found_common = false;
-      // scan the neighbors of nid_i64 i.e. forward edge 
-      for (int64_t c = 0; c < cols; ++c) {
-        auto cand = local_graph[static_cast<size_t>(nid_i64 * cols + c)];
-        auto cand_i64 = static_cast<int64_t>(cand);
-        if (cand_i64 < 0 || cand_i64 >= old_rows || cand == nid || cand == static_cast<IdxT>(new_row_id)) {
-          continue;
-        }
-        // check if the neighbour in each fowrward edge (i.e. cand) is already present 
-        // in current adj list (adjacency) of newly inserted point
-        if (std::find(adjacency.begin(), adjacency.end(), cand) != adjacency.end()) {
-          replace_candidate = cand;
-          found_common      = true;
-          break;
-        }
-      }
-      if (!found_common) { continue; }
-      // Do the actual re-wiring of the reverse edge
-      for (int64_t c = 0; c < cols; ++c) {
-        if (local_graph[static_cast<size_t>(nid_i64 * cols + c)] == replace_candidate) {
-          local_graph[static_cast<size_t>(nid_i64 * cols + c)] = static_cast<IdxT>(new_row_id);
-          inserted_any = true;
-          row_touched[static_cast<size_t>(nid_i64)] = 1;
-          break;
-        }
-      }
-    }
-    // fallback, if no reverse edges added for the newly inserted row then forcible add one reverse edges 
-    // with first entry in adjacency list
-    if (!inserted_any && !adjacency.empty()) {
-      int64_t nid_i64 = static_cast<int64_t>(adjacency.front());
-      if (nid_i64 >= 0 && nid_i64 < old_rows) {
-        local_graph[static_cast<size_t>(nid_i64 * cols)] = static_cast<IdxT>(new_row_id);
-        row_touched[static_cast<size_t>(nid_i64)] = 1;
-      }
-    }
-  }  // end Phase 2
-
-  // Merge old rows by selecting one row-local row copy (naive policy).
-  std::vector<IdxT> host_graph_final(static_cast<size_t>(new_rows * cols), IdxT{0});
-  //std::mt19937 rng(12345);
-  int64_t touched_old_rows = 0;
-  int64_t candidate_sum    = 0;
-   unsigned uUniqueNeighbours = 0;
-   unsigned uTotalNeighbours = 0;
-   // for every old row, find the right version of the adj list
-  // Host-side squared L2 distance helper — mirrors the per-element accumulation
-  // performed by compute_distance (dataset_descriptor_base_t::compute_distance) on
-  // the device, but runs on host_dataset which is already resident in CPU memory.
-  auto host_l2_sq = [&](int64_t row_a, int64_t row_b) -> float {
-    float dist = 0.f;
-    const T* a = host_dataset.data() + static_cast<size_t>(row_a) * static_cast<size_t>(dim);
-    const T* b = host_dataset.data() + static_cast<size_t>(row_b) * static_cast<size_t>(dim);
-    for (int64_t d = 0; d < dim; ++d) {
-      float diff = static_cast<float>(a[d]) - static_cast<float>(b[d]);
-      dist += diff * diff;
-    }
-    return dist;
-  };
-  for (int64_t r = 0; r < old_rows; ++r) {
-    // Its a 2D matrix
-    // Rows : every newly inserted row, cols: which olds rows adj list got updates.
-    // scan col major manner to know how many version of adj list are there for each old row
-    std::vector<int64_t> candidate_versions;
-    candidate_versions.reserve(static_cast<size_t>(batch_size));
-    for (int64_t row_version = 0; row_version < batch_size; ++row_version) {
-      if (row_old_row_touched[static_cast<size_t>(row_version)][static_cast<size_t>(r)] != 0) {
-        candidate_versions.push_back(row_version);
-      }
-    }
-
-    if (!candidate_versions.empty()) {
-      ++touched_old_rows;
-      candidate_sum += static_cast<int64_t>(candidate_versions.size());
-    }
-   
-    if (candidate_versions.empty()) {
-      std::copy(host_graph_old.begin() + static_cast<size_t>(r * cols),
-                host_graph_old.begin() + static_cast<size_t>((r + 1) * cols),
-                host_graph_final.begin() + static_cast<size_t>(r * cols));
-    } else {
-      /*std::uniform_int_distribution<size_t> dist(0, candidate_versions.size() - 1);
-      int64_t chosen_version = candidate_versions[dist(rng)];
-      const auto& chosen_graph = row_local_old_graphs[static_cast<size_t>(chosen_version)];*/
-      // Compute overlap metrics across all row-local versions for this old row.
-      std::vector<IdxT> vecUnion;
-      for (size_t uIter = 0; uIter < candidate_versions.size(); ++uIter) {
-        int64_t version_id = candidate_versions[uIter];
-        const auto& version_graph = row_local_old_graphs[static_cast<size_t>(version_id)];
-        vecUnion.insert(vecUnion.end(),
-                        version_graph.begin() + static_cast<size_t>(r * cols),
-                        version_graph.begin() + static_cast<size_t>((r + 1) * cols));
-      }
-
-      uTotalNeighbours += static_cast<unsigned>(vecUnion.size());
-      std::unordered_set<IdxT> unique_elements(vecUnion.begin(), vecUnion.end());
-      uUniqueNeighbours += static_cast<unsigned>(unique_elements.size());
-
-      // Compute distances from row r to all unique neighbors, then select the closest 'cols' ones.
-      // Build (distance, neighbor_id) pairs for all valid unique neighbors.
-      std::vector<std::pair<float, IdxT>> dist_neighbor_pairs;
-      dist_neighbor_pairs.reserve(unique_elements.size());
-      for (auto nb : unique_elements) {
-        auto nb_i64 = static_cast<int64_t>(nb);
-        if (nb_i64 >= 0 && nb_i64 < new_rows) {
-          float d = host_l2_sq(r, nb_i64);
-          dist_neighbor_pairs.push_back({d, nb});
-        }
-      }
-      
-      // Sort by distance (ascending) to get closest neighbors first.
-      std::sort(dist_neighbor_pairs.begin(), dist_neighbor_pairs.end());
-      
-      // Fill host_graph_final[r] with the closest 'cols' neighbors.
-      int64_t num_to_take = std::min<int64_t>(cols, static_cast<int64_t>(dist_neighbor_pairs.size()));
-      for (int64_t c = 0; c < num_to_take; ++c) {
-        host_graph_final[static_cast<size_t>(r * cols + c)] = dist_neighbor_pairs[static_cast<size_t>(c)].second;
-      }
-      
-      // Pad remaining slots with the first (closest) neighbor if needed.
-      if (num_to_take < cols) {
-        IdxT pad_val = num_to_take > 0 ? dist_neighbor_pairs[0].second : static_cast<IdxT>(0);
-        for (int64_t c = num_to_take; c < cols; ++c) {
-          host_graph_final[static_cast<size_t>(r * cols + c)] = pad_val;
-        }
-      }
-  
-    }
-  }
-
-  // Append new rows from the global host_graph built in Phase 1.
-  if (batch_size > 0) {
-    std::copy(host_graph.begin() + static_cast<size_t>(old_rows * cols),
-              host_graph.begin() + static_cast<size_t>(new_rows * cols),
-              host_graph_final.begin() + static_cast<size_t>(old_rows * cols));
-  }
-  host_graph = std::move(host_graph_final);
-
-  double avg_candidates =
-    (touched_old_rows > 0) ? (static_cast<double>(candidate_sum) / touched_old_rows) : 0.0;
-  std::cout << "[insert][naive-merge] touched_old_rows=" << touched_old_rows << "/"
-            << old_rows << " avg_candidate_rows_per_touched_old_row=" << avg_candidates
-            << " common_neighbors=" << uTotalNeighbours - uUniqueNeighbours << " /" << uTotalNeighbours
-            << std::endl;
-
-  auto host_dataset_view = raft::make_host_matrix_view<const T, int64_t, raft::row_major>(
-    host_dataset.data(), total_rows, dim);
-  auto dataset_mr = get_mr(dataset_mem_);
-  cuvs::neighbors::cagra::detail::copy_with_padding(handle_, *dataset_, host_dataset_view, dataset_mr);
-  auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
-    dataset_->data_handle(), dataset_->extent(0), this->dim_, dataset_->extent(1));
-  index_->update_dataset(handle_, dataset_view);
-
-  auto graph_mr = get_mr(graph_mem_);
-  *graph_ = raft::make_device_mdarray<IdxT, int64_t>(
-    handle_, graph_mr, raft::make_extents<int64_t>(new_rows, cols));
-  raft::copy(graph_->data_handle(),
-             host_graph.data(),
-             static_cast<size_t>(new_rows) * static_cast<size_t>(cols),
-             stream);
-  raft::resource::sync_stream(handle_);
-  index_->update_graph(handle_, make_const_mdspan(graph_->view()));
-  
-
-  *input_dataset_v_ = raft::make_device_matrix_view<const T, int64_t>(
-    dataset_->data_handle(), dataset_->extent(0), this->dim_);
-  need_dataset_update_ = false;
-  has_inserted_data_   = true;
-
-  if (insert_params_.persist && graph_file_.has_value() && !graph_file_->empty()) {
-    save(*graph_file_);
-    std::cout << "[insert] persisted updated index to " << *graph_file_ << std::endl;
-  }
-#endif
   std::cout << "[insert] complete: old_rows=" 
             /*<< old_rows
             << " inserted=" << batch_size
@@ -1925,7 +1642,9 @@ void cuvs_cagra<T, IdxT>::delete_vectors(const uint64_t* ids, size_t num_ids)
     cached_graph_ptr,
     (long long)cached_graph_rows,
     (long long)cached_graph_cols);
-  detail::launch_cuvs_bang_delete_kernel(ids, num_ids, graph_ptr, graph_rows, graph_cols, d_deleted_rows_);
+  #if 1
+    detail::launch_cuvs_bang_delete_kernel(ids, num_ids, graph_ptr, graph_rows, graph_cols, d_deleted_rows_);
+  #endif
   // log the graph dimensions after deletion for debugging
   raft::resource::sync_stream(handle_);
   auto post_delete_graph_view = index_->graph();
@@ -2049,7 +1768,7 @@ void cuvs_cagra<T, IdxT>::search_ex(
 {
   static_assert(std::is_integral_v<algo_base::index_type>);
   static_assert(std::is_integral_v<IdxT>);
-
+  auto start = std::chrono::high_resolution_clock::now(); 
   if (neighbors == nullptr || distances == nullptr) {
     throw std::runtime_error("search_ex requires non-null neighbors and distances pointers");
   }
@@ -2057,6 +1776,7 @@ void cuvs_cagra<T, IdxT>::search_ex(
   auto graph_view = index_->graph();
   auto graph_rows = graph_view.extent(0);
   auto graph_cols = graph_view.extent(1);
+  #if 0
   // copy graph to host for validation
   std::vector<IdxT> graph_host(static_cast<size_t>(graph_rows * graph_cols), IdxT{0});
   raft::copy(graph_host.data(), graph_view.data_handle(), graph_rows * graph_cols, raft::resource::get_cuda_stream(handle_));
@@ -2074,7 +1794,7 @@ void cuvs_cagra<T, IdxT>::search_ex(
           }
       }
   } 
-
+#endif
   auto k0                       = static_cast<size_t>(refine_ratio_ * k);
   const bool disable_refinement = k0 <= static_cast<size_t>(k);
   const raft::resources& res    = handle_;
@@ -2262,5 +1982,8 @@ void cuvs_cagra<T, IdxT>::search_ex(
     }
   }
   #endif
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration_ms = end - start;
+  std::cout << "[search_ex] search_ex took " << duration_ms.count() << " ms for " << batch_size << " queries." << std::endl;  
 }
 }  // namespace cuvs::bench
