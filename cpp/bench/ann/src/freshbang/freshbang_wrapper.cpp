@@ -244,8 +244,16 @@ FreshBANG<T>::FreshBANG() : m_pImpl(nullptr)
 template <typename T>
 FreshBANG<T>::~FreshBANG()
 {
-  delete static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
-  m_pImpl = nullptr;
+  // save the index to disk if it has been built
+  if (m_pImpl != nullptr) {
+    auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+    if (impl->has_live_index()) {
+      std::cout << "[FreshBANG] Destructor: Saving index to disk before cleanup" << std::endl;
+      SaveIndex();
+    }
+    delete impl;
+    m_pImpl = nullptr;
+  }
   std::cout << "[FreshBANG] Destructor called" << std::endl;
 }
 
@@ -443,8 +451,11 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
   }
 
   auto sp_json = index.search_params[0];
+  // log the search parameters for debugging
+  std::cout << "[FreshBANG::SetSearchParams] Original search_params JSON: " << sp_json.dump()
+            << std::endl;
   sp_json["k"] = params.recall_at_k;
-
+  
   auto dataset_for_search = cuvs::bench::make_dataset<T>(
     conf.get_dataset_conf(), true, impl->prefer_insert_dataset_for_search());
   auto search_param = cuvs::bench::detail::create_search_param<T>(index.algo, sp_json);
@@ -802,7 +813,7 @@ void FreshBANG<T>::BatchedDelete(const uint64_t* ids, uint32_t batch_size)
     return;
   }
 
-  algo_obj->delete_vectors(ids, static_cast<size_t>(batch_size));
+ algo_obj->delete_vectors(ids, static_cast<size_t>(batch_size));
   std::cout << "[FreshBANG::BatchedDelete] delete() completed with index saved" << std::endl;
 }
 

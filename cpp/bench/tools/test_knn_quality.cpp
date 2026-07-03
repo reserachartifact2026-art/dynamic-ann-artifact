@@ -8,6 +8,9 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <array>
+#include <iomanip>
+#include <numeric>
 #include <unordered_set>
 #include <cstring>
 #include <omp.h>
@@ -142,6 +145,7 @@ int main(int argc, char** argv)
 {
     bool check_order = false;
     int order_check_k = -1;
+    bool check_bidirectional = false;
 
     bool use_row_range = false;
     int row_start = 0;
@@ -176,7 +180,14 @@ int main(int argc, char** argv)
 
             argi += 2;
         }
+	// --------------------------------------------------------
+	// --check-bidirectional
+	// --------------------------------------------------------
+	else if (arg == "--check-bidirectional") {
 
+		check_bidirectional = true;
+		argi += 1;
+	}
         // --------------------------------------------------------
         // --row-range <start> <end>
         // --------------------------------------------------------
@@ -200,7 +211,17 @@ int main(int argc, char** argv)
 
         else {
             break;
-        }
+
+	}
+	if (check_order && check_bidirectional) {
+
+		std::cerr
+			<< "Choose only one of "
+			<< "--check-order or "
+			<< "--check-bidirectional\n";
+
+		return 1;
+	}
     }
 
     // ============================================================
@@ -221,6 +242,12 @@ int main(int argc, char** argv)
             << " --check-order <K>"
             << " [--row-range start end]"
             << " graph.bin vectors.fbin\n";
+
+	std::cerr
+            << "  " << argv[0]
+	    << "--check-bidirectional"
+            << "[--row-range start end]"
+            << "graph.bin vectors.fbin\n";
 
         return 1;
     }
@@ -303,8 +330,9 @@ int main(int argc, char** argv)
     // Recall@K against brute-force groundtruth
     // ============================================================
 
-    if (!check_order)
+    if (!check_order && !check_bidirectional)
     {
+	// Recall mode
         double total_recall = 0.0;
 
         #pragma omp parallel
@@ -408,8 +436,9 @@ int main(int argc, char** argv)
     // Neighbor ordering quality
     // ============================================================
 
-    else
+    else if (check_order)
     {
+        // ordering mode
         double sorted_rows = 0.0;
 
         #pragma omp parallel
@@ -502,6 +531,202 @@ int main(int argc, char** argv)
 
         std::cout << "Ordering Quality Score : "
                   << score << "\n";
+    }
+    // ============================================================
+    // OPTIONAL MODE:
+    // Bidirectional Edge Quality
+    // ============================================================
+
+    else if (check_bidirectional)
+    {
+            // bidirectional mode
+	    double total_percentage = 0.0;
+
+	    double min_percentage = 100.0;
+	    double max_percentage = 0.0;
+
+	    size_t fully_bidirectional = 0;
+
+	    // percentage for every processed row
+	    std::vector<double> percentages(total_rows_considered);
+
+	    // histogram buckets:
+	    // 0-10 ... 90-100
+	    std::array<size_t,10> histogram{};
+
+
+#pragma omp parallel
+	    {
+		    double local_total = 0.0;
+
+		    double local_min = 100.0;
+		    double local_max = 0.0;
+
+		    size_t local_full = 0;
+
+#pragma omp for schedule(dynamic, 1024)
+		    for (int i = row_start; i <= row_end; i++) {
+
+			    int bidirectional = 0;
+
+			    const IdxT* nbrs =
+				    &G.adj[size_t(i) * K];
+
+			    for (int j = 0; j < K; j++) {
+
+				    IdxT v = nbrs[j];
+
+				    if (v >= (IdxT)N)
+					    continue;
+
+				    const IdxT* nbrs_v =
+					    &G.adj[size_t(v) * K];
+
+				    bool found = false;
+
+				    for (int t = 0; t < K; t++) {
+
+					    if (nbrs_v[t] == (IdxT)i) {
+
+						    found = true;
+						    break;
+					    }
+				    }
+
+				    if (found)
+					    bidirectional++;
+			    }
+
+			    double pct =
+				    100.0 * bidirectional / K;
+
+			    percentages[i - row_start] = pct;
+			    local_total += pct;
+
+			    if (pct < local_min)
+				    local_min = pct;
+
+			    if (pct > local_max)
+				    local_max = pct;
+
+			    if (bidirectional == K)
+				    local_full++;
+		    }
+
+#pragma omp atomic
+		    total_percentage += local_total;
+
+#pragma omp critical
+		    {
+			    min_percentage =
+				    std::min(min_percentage, local_min);
+
+			    max_percentage =
+				    std::max(max_percentage, local_max);
+
+			    fully_bidirectional += local_full;
+		    }
+	    }
+
+	    double avg_percentage =
+		    total_percentage / total_rows_considered;
+
+	    // ----------------------------------------------------
+	    // Median
+	    // ----------------------------------------------------
+
+	    std::sort(
+			    percentages.begin(),
+			    percentages.end());
+
+	    double median;
+
+	    if (total_rows_considered % 2 == 0) {
+
+		    median =
+			    (percentages[total_rows_considered / 2 - 1] +
+			     percentages[total_rows_considered / 2]) / 2.0;
+	    }
+	    else {
+
+		    median =
+			    percentages[total_rows_considered / 2];
+	    }
+
+	    // ----------------------------------------------------
+	    // Histogram
+	    // ----------------------------------------------------
+
+	    for (double pct : percentages) {
+
+		    int bucket =
+			    static_cast<int>(pct / 10.0);
+
+		    if (bucket == 10)
+			    bucket = 9;
+
+		    histogram[bucket]++;
+	    }
+
+
+	    std::cout << "\n========================\n";
+	    std::cout << "Bidirectional Edge Quality\n";
+	    std::cout << "========================\n";
+
+	    std::cout << "Nodes                : "
+		    << N << "\n";
+
+	    std::cout << "Graph Degree         : "
+		    << K << "\n";
+
+	    std::cout << "Row Range            : "
+		    << row_start
+		    << " - "
+		    << row_end
+		    << "\n";
+
+	    std::cout << "Rows Considered      : "
+		    << total_rows_considered
+		    << "\n";
+
+	    std::cout << "Average              : "
+		    << avg_percentage
+		    << "%\n";
+
+	    std::cout << "Median               : "
+		    << median
+		    << "%\n";
+
+	    std::cout << "Minimum              : "
+		    << min_percentage
+		    << "%\n";
+
+	    std::cout << "Maximum              : "
+		    << max_percentage
+		    << "%\n";
+
+	    std::cout << "Fully Bidirectional  : "
+		    << fully_bidirectional
+		    << " ("
+		    << 100.0 * fully_bidirectional /
+		    total_rows_considered
+		    << "%)\n";
+
+	    std::cout << "\nHistogram\n";
+	    std::cout << "---------\n";
+
+	    for (int i = 0; i < 10; i++) {
+
+		    int low = i * 10;
+		    int high = (i + 1) * 10;
+
+		    std::cout
+			    << std::setw(2) << low
+			    << "-" << std::setw(3) << high
+			    << "% : "
+			    << histogram[i]
+			    << "\n";
+	    }		    
     }
 
     return 0;
