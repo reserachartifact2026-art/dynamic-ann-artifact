@@ -72,7 +72,13 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                     const uint32_t* graph,
                                     int64_t graph_rows,
                                     int64_t graph_cols,
-                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows);
+                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
+                                    uint32_t* d_frontier_curr,
+                                    uint32_t* d_frontier_next,
+                                    int* d_frontier_size,
+                                    int* d_next_size,
+                                    int64_t frontier_capacity,
+                                    size_t max_workspace_ids);
 }
 
 enum class AllocatorType { kHostPinned, kHostHugePage, kDevice };
@@ -257,6 +263,15 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
 
   std::shared_ptr<rmm::device_buffer> d_dist_threshold1_;
   std::shared_ptr<rmm::device_buffer> d_dist_threshold2_;
+
+  std::shared_ptr<rmm::device_buffer> d_delete_frontier_curr_;
+  std::shared_ptr<rmm::device_buffer> d_delete_frontier_next_;
+  std::shared_ptr<rmm::device_buffer> d_delete_frontier_size_;
+  std::shared_ptr<rmm::device_buffer> d_delete_next_size_;
+  int64_t delete_workspace_frontier_capacity_{0};
+  size_t delete_workspace_max_ids_{0};
+
+  void ensure_delete_workspace(size_t required_ids, int64_t graph_rows);
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {
@@ -937,9 +952,54 @@ std::unique_ptr<algo<T>> cuvs_cagra<T, IdxT>::copy()
 }
 
 template <typename T, typename IdxT>
+void cuvs_cagra<T, IdxT>::ensure_delete_workspace(size_t required_ids, int64_t graph_rows)
+{
+  if (required_ids == 0 || graph_rows <= 0) { return; }
+
+  auto required_frontier_capacity = graph_rows * 1;
+  if (required_frontier_capacity <= 0) { required_frontier_capacity = 1; }
+
+  const bool needs_realloc = !d_delete_frontier_curr_ || !d_delete_frontier_next_ ||
+                             !d_delete_frontier_size_ || !d_delete_next_size_ ||
+                             delete_workspace_max_ids_ < required_ids ||
+                             delete_workspace_frontier_capacity_ < required_frontier_capacity;
+
+  if (!needs_realloc) { return; }
+
+  auto stream            = handle_.get_sync_stream();
+  auto frontier_total    = static_cast<uint64_t>(required_ids) *
+                        static_cast<uint64_t>(required_frontier_capacity);
+  auto frontier_bytes    = frontier_total * sizeof(uint32_t);
+  auto counters_bytes    = required_ids * sizeof(int);
+
+  d_delete_frontier_curr_ = std::make_shared<rmm::device_buffer>(
+    frontier_bytes, stream, get_mr(AllocatorType::kDevice));
+  d_delete_frontier_next_ = std::make_shared<rmm::device_buffer>(
+    frontier_bytes, stream, get_mr(AllocatorType::kDevice));
+  d_delete_frontier_size_ = std::make_shared<rmm::device_buffer>(
+    counters_bytes, stream, get_mr(AllocatorType::kDevice));
+  d_delete_next_size_ = std::make_shared<rmm::device_buffer>(
+    counters_bytes, stream, get_mr(AllocatorType::kDevice));
+
+  delete_workspace_frontier_capacity_ = required_frontier_capacity;
+  delete_workspace_max_ids_           = required_ids;
+
+  std::printf("[bang] delete workspace allocated once: ids_cap=%zu frontier_cap=%lld total_bytes=%llu\n",
+              delete_workspace_max_ids_,
+              static_cast<long long>(delete_workspace_frontier_capacity_),
+              static_cast<unsigned long long>(2 * frontier_bytes + 2 * counters_bytes));
+}
+
+template <typename T, typename IdxT>
 void cuvs_cagra<T, IdxT>::set_insert_param(const insert_param& param)
 {
   insert_params_ = param;
+
+  auto graph_rows = index_ ? index_->graph().extent(0) : static_cast<int64_t>(rows_);
+  auto warmup_ids = param.max_chunk_size > 0 ? static_cast<size_t>(param.max_chunk_size) : size_t{0};
+  if (warmup_ids > 0 && graph_rows > 0) {
+    ensure_delete_workspace(warmup_ids, graph_rows);
+  }
 }
 
 template <typename T, typename IdxT>
@@ -1609,6 +1669,12 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
             << " graph_cols=" << cols*/
             << " dataset_rows=" << dataset_->extent(0)
             << std::endl;
+
+ // save index
+   if (insert_params_.persist && graph_file_.has_value() && !graph_file_->empty()) {
+      save(*graph_file_+"_after_10kinsert");
+      std::cout << "[insert] persisted updated index to " << *graph_file_+"_after_10kinsert" << std::endl;
+    }            
 }
 
 
@@ -1642,8 +1708,23 @@ void cuvs_cagra<T, IdxT>::delete_vectors(const uint64_t* ids, size_t num_ids)
     cached_graph_ptr,
     (long long)cached_graph_rows,
     (long long)cached_graph_cols);
+
+  ensure_delete_workspace(num_ids, graph_rows);
+
   #if 1
-    detail::launch_cuvs_bang_delete_kernel(ids, num_ids, graph_ptr, graph_rows, graph_cols, d_deleted_rows_);
+    detail::launch_cuvs_bang_delete_kernel(
+      ids,
+      num_ids,
+      graph_ptr,
+      graph_rows,
+      graph_cols,
+      d_deleted_rows_,
+      static_cast<uint32_t*>(d_delete_frontier_curr_->data()),
+      static_cast<uint32_t*>(d_delete_frontier_next_->data()),
+      static_cast<int*>(d_delete_frontier_size_->data()),
+      static_cast<int*>(d_delete_next_size_->data()),
+      delete_workspace_frontier_capacity_,
+      delete_workspace_max_ids_);
   #endif
   // log the graph dimensions after deletion for debugging
   raft::resource::sync_stream(handle_);

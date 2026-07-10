@@ -294,7 +294,13 @@ __global__ void cuvs_bang_delete_kernel1(DeleteKernelParams params)
 }  
 
 
-__global__ void cuvs_bang_delete_kernel2_old(DeleteKernelParams params)
+
+__global__ void cuvs_bang_delete_kernel2_BFS_shm(DeleteKernelParams params,
+                                                 uint32_t* frontier_curr_all,
+                                                 uint32_t* frontier_next_all,
+                                                 int* frontier_size_all,
+                                                 int* next_size_all,
+                                                 int64_t frontier_capacity)
 {
   // Print graph dimensions once from thread 0 and also first and last row_num to be deleted
   if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -313,6 +319,178 @@ __global__ void cuvs_bang_delete_kernel2_old(DeleteKernelParams params)
   if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
 
   if (params.deleted_rows[cur_row] != 1) { return; } // skip if not marked deleted
+
+  auto block_offset = static_cast<uint64_t>(row_idx) * static_cast<uint64_t>(frontier_capacity);
+  auto* frontier_curr = frontier_curr_all + block_offset;
+  auto* frontier_next = frontier_next_all + block_offset;
+  auto* frontier_size = frontier_size_all + row_idx;
+  auto* next_size     = next_size_all + row_idx;
+
+  // Diagnostics: count IN-edge replacements discovered by BFS.
+  __shared__ unsigned long long bfs_in_edges_count;
+  if (col_idx == 0) {
+    bfs_in_edges_count    = 0;
+  }
+  __syncthreads();
+
+  // find a guaranteed non-deleted neighbour of cur_row to replace deleted-row references.
+  // Only thread 0 scans the adjacency list; all others wait at __syncthreads().
+  // Using uint32_t to match the graph element type; UINT32_MAX is the "not found" sentinel.
+  __shared__ uint32_t backup_replacement_neighbor ;
+  if (col_idx == 0) {
+    backup_replacement_neighbor = UINT32_MAX; // sentinel: no valid backup found yet
+    for (int64_t c = 0; c < params.graph_cols; c++) {
+      uint32_t nb = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + c];
+      if (static_cast<int64_t>(nb) < params.graph_rows && params.deleted_rows[nb] != 1) {
+        backup_replacement_neighbor = nb;
+        break;
+      }
+    }
+    if (backup_replacement_neighbor == UINT32_MAX) {
+      printf("[bang_kernel] WARNING: No non-deleted neighbor found for deleted row %llu\n",
+             (unsigned long long)cur_row);
+    }
+  }
+
+  __syncthreads();
+#if 0
+  // Ground truth: linear scan over the full graph for incoming references to cur_row.
+  for (int64_t col = col_idx; col < params.graph_cols; col += blockDim.x) {
+    unsigned long long local_hits = 0;
+    for (int64_t row = 0; row < params.graph_rows; ++row) {
+      auto neighbor = params.graph[row * static_cast<uint64_t>(params.graph_cols) + col];
+      if (neighbor == cur_row) { ++local_hits; }
+    }
+    if (local_hits > 0) { atomicAdd(&linear_in_edges_count, local_hits); }
+  }
+  #endif
+  __syncthreads();
+
+  // Bounded BFS over candidate rows likely to contain incoming references to cur_row.
+  // This avoids a full O(graph_rows * graph_cols) scan per deleted row.
+  constexpr int kBfsLevels      = 2;
+
+  if (col_idx == 0) {
+    *frontier_size = 0;
+    *next_size     = 0;
+    for (int64_t c = 0; c < params.graph_cols && *frontier_size < frontier_capacity; ++c) {
+      uint32_t seed = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + c];
+      if (static_cast<int64_t>(seed) >= params.graph_rows) { continue; }
+      if (seed == cur_row || params.deleted_rows[seed] == 1) { continue; }
+      frontier_curr[(*frontier_size)++] = seed;
+    }
+  }
+  __syncthreads();
+
+  for (int level = 0; level < kBfsLevels; ++level) {
+    int curr_size = *frontier_size;
+    if (curr_size == 0) { break; }
+
+    for (int node_pos = col_idx; node_pos < curr_size; node_pos += blockDim.x) {
+      uint32_t node = frontier_curr[node_pos];
+      if (static_cast<int64_t>(node) >= params.graph_rows || params.deleted_rows[node] == 1) {
+        // log this as a warning, but continue processing other nodes in the frontier
+       /* printf("[bang_kernel][WARNING] BFS frontier node %llu is invalid or deleted; skipping.\n",
+               (unsigned long long)node);*/
+        continue;
+      }
+
+      // Each thread owns a distinct frontier node and scans its full adjacency list.
+      unsigned long long local_bfs_hits = 0;
+      for (int64_t col = 0; col < params.graph_cols; ++col) {
+        auto off      = node * static_cast<uint64_t>(params.graph_cols) + col;
+        auto neighbor = params.graph[off];
+
+        if (static_cast<int64_t>(neighbor) < params.graph_rows && neighbor != cur_row &&
+            params.deleted_rows[neighbor] != 1) {
+          int pos = atomicAdd(next_size, 1);
+          if (pos < frontier_capacity) 
+          { 
+            frontier_next[pos] = neighbor; 
+          }
+          else
+          {
+            /* printf("[bang_kernel][WARNING] BFS frontier capacity exceeded for deleted row %llu; some neighbors may not be processed.\n",
+                   (unsigned long long)cur_row);*/
+          }
+        }
+
+        if (neighbor == cur_row) {
+          ++local_bfs_hits;
+          uint32_t candidate = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + col];
+          if (static_cast<int64_t>(candidate) < params.graph_rows && params.deleted_rows[candidate] != 1) {
+            params.graph[off] = candidate;
+          } else if (backup_replacement_neighbor != UINT32_MAX) {
+            params.graph[off] = backup_replacement_neighbor;
+          }
+        }
+      }
+      if (local_bfs_hits > 0) { atomicAdd(&bfs_in_edges_count, local_bfs_hits); }
+    } // end for for current frontier
+
+    __syncthreads();
+
+    // Swap next frontier into current frontier for the next iteration.
+    int capped_size = *next_size > frontier_capacity ? static_cast<int>(frontier_capacity)
+                                                     : *next_size;
+    for (int i = col_idx; i < capped_size; i += blockDim.x) {
+      frontier_curr[i] = frontier_next[i];
+    }
+    __syncthreads();
+
+    if (col_idx == 0) {
+      *frontier_size = capped_size;
+      *next_size     = 0;
+    }
+    __syncthreads();
+  } // end for BFS levels
+#if 0
+  if (col_idx == 0 && bfs_in_edges_count != linear_in_edges_count) {
+    printf("\n[bang_kernel][WARNING][IN_EDGE_MISMATCH] ***************************************\n");
+    printf("[bang_kernel][WARNING][IN_EDGE_MISMATCH] deleted_row=%llu linear_in_edges=%llu bfs_discovered_in_edges=%llu\n",
+           (unsigned long long)cur_row,
+           (unsigned long long)linear_in_edges_count,
+           (unsigned long long)bfs_in_edges_count);
+    printf("[bang_kernel][WARNING][IN_EDGE_MISMATCH] BFS did not match linear scan.\n");
+    printf("[bang_kernel][WARNING][IN_EDGE_MISMATCH] ***************************************\n\n");
+  }
+
+#endif
+}
+
+
+
+
+__global__ void cuvs_bang_delete_kernel2_BFS_shm_bkp(DeleteKernelParams params,
+                                                 uint32_t* frontier_curr_all,
+                                                 uint32_t* frontier_next_all,
+                                                 int* frontier_size_all,
+                                                 int* next_size_all,
+                                                 int64_t frontier_capacity)
+{
+  // Print graph dimensions once from thread 0 and also first and last row_num to be deleted
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("[bang_kernel] graph_rows=%lld graph_cols=%lld num_ids=%llu first_row=%llu last_row=%llu\n",
+           (long long)params.graph_rows, (long long)params.graph_cols, (unsigned long long)params.num_ids,
+           (unsigned long long)params.row_num[0], (unsigned long long)params.row_num[params.num_ids - 1]);
+  }
+
+  auto row_idx = blockIdx.x;
+  auto col_idx = threadIdx.x;
+  if (row_idx >= params.num_ids || col_idx >= params.graph_cols) { return; }
+
+  // identify the current row to be deleted by this thread-block
+  auto cur_row = params.row_num[row_idx];
+
+  if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
+
+  if (params.deleted_rows[cur_row] != 1) { return; } // skip if not marked deleted
+
+  auto block_offset = static_cast<uint64_t>(row_idx) * static_cast<uint64_t>(frontier_capacity);
+  auto* frontier_curr = frontier_curr_all + block_offset;
+  auto* frontier_next = frontier_next_all + block_offset;
+  auto* frontier_size = frontier_size_all + row_idx;
+  auto* next_size     = next_size_all + row_idx;
 
   // find a guaranteed non-deleted neighbour of cur_row to replace deleted-row references.
   // Only thread 0 scans the adjacency list; all others wait at __syncthreads().
@@ -337,34 +515,27 @@ __global__ void cuvs_bang_delete_kernel2_old(DeleteKernelParams params)
 
   // Bounded BFS over candidate rows likely to contain incoming references to cur_row.
   // This avoids a full O(graph_rows * graph_cols) scan per deleted row.
-  constexpr int kBfsLevels      = 5;
-  constexpr int kMaxBfsFrontier = 4096;
-
-  __shared__ uint32_t frontier_curr[kMaxBfsFrontier];
-  __shared__ uint32_t frontier_next[kMaxBfsFrontier];
-  __shared__ int frontier_size;
-  __shared__ int next_size;
+  constexpr int kBfsLevels      = 8;
 
   if (col_idx == 0) {
-    frontier_size = 0;
-    next_size     = 0;
-    for (int64_t c = 0; c < params.graph_cols && frontier_size < kMaxBfsFrontier; ++c) {
+    *frontier_size = 0;
+    *next_size     = 0;
+    for (int64_t c = 0; c < params.graph_cols && *frontier_size < frontier_capacity; ++c) {
       uint32_t seed = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + c];
       if (static_cast<int64_t>(seed) >= params.graph_rows) { continue; }
       if (seed == cur_row || params.deleted_rows[seed] == 1) { continue; }
-      frontier_curr[frontier_size++] = seed;
+      frontier_curr[(*frontier_size)++] = seed;
     }
   }
   __syncthreads();
 
   for (int level = 0; level < kBfsLevels; ++level) {
-    if (frontier_size == 0) { break; }
+    int curr_size = *frontier_size;
+    if (curr_size == 0) { break; }
 
-    for (int node_pos = 0; node_pos < frontier_size; ++node_pos) {
+    for (int node_pos = 0; node_pos < curr_size; ++node_pos) {
       uint32_t node = frontier_curr[node_pos];
       if (static_cast<int64_t>(node) >= params.graph_rows || params.deleted_rows[node] == 1) {
-        __syncthreads();
-        __syncthreads();
         continue;
       }
 
@@ -388,50 +559,34 @@ __global__ void cuvs_bang_delete_kernel2_old(DeleteKernelParams params)
         uint32_t nb = params.graph[node * static_cast<uint64_t>(params.graph_cols) + col];
         if (static_cast<int64_t>(nb) >= params.graph_rows) { continue; }
         if (nb == cur_row || params.deleted_rows[nb] == 1) { continue; }
-        int pos = atomicAdd(&next_size, 1);
-        if (pos < kMaxBfsFrontier) { frontier_next[pos] = nb; }
+        int pos = atomicAdd(next_size, 1);
+        if (pos < frontier_capacity) { frontier_next[pos] = nb; }
       }
       __syncthreads();
     }
 
-    // Move next frontier into current frontier for the next level.
-    int capped_size = next_size > kMaxBfsFrontier ? kMaxBfsFrontier : next_size;
+    // Swap next frontier into current frontier for the next iteration.
+    int capped_size = *next_size > frontier_capacity ? static_cast<int>(frontier_capacity)
+                                                     : *next_size;
     for (int i = col_idx; i < capped_size; i += blockDim.x) {
       frontier_curr[i] = frontier_next[i];
     }
     __syncthreads();
 
     if (col_idx == 0) {
-      frontier_size = capped_size;
-      next_size     = 0;
+      *frontier_size = capped_size;
+      *next_size     = 0;
     }
     __syncthreads();
-  }
+  } // end for BFS levels
 
-    #if 0
-      uint32_t temp_iter = 0;
-      while (temp_iter++ < params.graph_cols-1) {
-        uint32_t cur_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + temp_iter];
-        if (params.deleted_rows[cur_neighbour] != 1) {
-          // Copy adjacency list of a live neighbor into the deleted row.
-          for (int64_t col = 0; col < params.graph_cols; col++) {
-            uint32_t candidate = params.graph[cur_neighbour * static_cast<uint64_t>(params.graph_cols) + col];
-            if ((params.deleted_rows[candidate] != 1)) {
-              params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col] = candidate;
-            } else {
-              params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + col] = 1;
-            }
-          }
-          break;
-        }
-      } // end while
-    #endif
+
 }
 
 
 
 
-__global__ void cuvs_bang_delete_kernel2(DeleteKernelParams params)
+__global__ void cuvs_bang_delete_kernel2_naive(DeleteKernelParams params)
 {
   // Print graph dimensions once from thread 0 and also first and last row_num to be deleted
   if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -544,10 +699,31 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                     const uint32_t* graph_ptr,
                                     int64_t graph_rows,
                                     int64_t graph_cols,
-                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows)
+                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
+                                    uint32_t* d_frontier_curr,
+                                    uint32_t* d_frontier_next,
+                                    int* d_frontier_size,
+                                    int* d_next_size,
+                                    int64_t frontier_capacity,
+                                    size_t max_workspace_ids)
 {
   if (num_ids == 0) { return; }
   if (graph_rows <= 0 || graph_cols <= 0) { return; }
+  if (!d_frontier_curr || !d_frontier_next || !d_frontier_size || !d_next_size) {
+    std::printf("[bang] delete kernel missing workspace buffers\n");
+    return;
+  }
+  if (num_ids > max_workspace_ids) {
+    std::printf("[bang] delete kernel workspace too small: num_ids=%zu max_ids=%zu\n",
+                num_ids,
+                max_workspace_ids);
+    return;
+  }
+  if (frontier_capacity <= 0) {
+    std::printf("[bang] delete kernel invalid frontier_capacity=%lld\n",
+                static_cast<long long>(frontier_capacity));
+    return;
+  }
   
   auto* mutable_graph_ptr = const_cast<uint32_t*>(graph_ptr);
   DeleteKernelParams params{nullptr, num_ids, mutable_graph_ptr, graph_rows, graph_cols,
@@ -560,7 +736,17 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
   auto blocks                = static_cast<uint32_t>((num_ids + threads - 1) / threads);
 
   cuvs_bang_delete_kernel1<<<blocks, threads>>>(params);
-  cuvs_bang_delete_kernel2<<<num_ids, graph_cols>>>(params);
+
+  RAFT_CUDA_TRY(cudaMemset(d_frontier_size, 0, num_ids * sizeof(int)));
+  RAFT_CUDA_TRY(cudaMemset(d_next_size, 0, num_ids * sizeof(int)));
+
+  auto bfs_threads = static_cast<uint32_t>(graph_cols > 1024 ? 1024 : graph_cols);
+  cuvs_bang_delete_kernel2_BFS_shm<<<num_ids, bfs_threads>>>(params,
+                                                              d_frontier_curr,
+                                                              d_frontier_next,
+                                                              d_frontier_size,
+                                                              d_next_size,
+                                                              frontier_capacity);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
