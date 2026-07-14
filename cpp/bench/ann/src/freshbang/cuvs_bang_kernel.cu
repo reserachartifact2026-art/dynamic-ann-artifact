@@ -22,6 +22,9 @@ namespace cuvs::bench::detail {
     int64_t graph_rows;
     int64_t graph_cols;
     uint8_t* deleted_rows;
+    uint32_t* reverse_graph;
+    int64_t reverse_graph_cols;
+    uint32_t* reverse_counts;
   } DeleteKernelParams;
 
     typedef struct _InsertKernelParams {
@@ -32,7 +35,10 @@ namespace cuvs::bench::detail {
     int64_t graph_cols;
     uint8_t* deleted_rows;
     float* d_distance_threshold1; // to be used for insertions
-    float* d_distance_threshold2; // to be used for insertions  
+    float* d_distance_threshold2; // to be used for insertions
+    uint32_t* reverse_graph;
+    int64_t reverse_graph_cols;
+    uint32_t* reverse_counts;
   } InsertKernelParams;
 
 __device__ __forceinline__ bool is_row_in_insert_batch(const InsertKernelParams& params,
@@ -49,6 +55,53 @@ __device__ __forceinline__ bool is_invalid_or_deleted_neighbor(const InsertKerne
 {
   if (static_cast<int64_t>(neighbor) >= params.graph_rows) { return true; }
   return params.deleted_rows[neighbor] == 1;
+}
+
+__global__ void cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
+                                                     int64_t graph_rows,
+                                                     int64_t graph_cols,
+                                                     uint32_t* reverse_graph,
+                                                     int64_t reverse_graph_cols,
+                                                     const uint8_t* deleted_rows,
+                                                     uint32_t* reverse_counts,
+                                                     uint32_t* dropped_edges_count,
+                                                     uint32_t* skipped_invalid_dst_count,
+                                                     uint32_t* skipped_deleted_src_count,
+                                                     uint32_t* skipped_deleted_dst_count)
+{
+  auto col_idx = static_cast<int64_t>(threadIdx.x);
+  auto row_idx = static_cast<int64_t>(blockIdx.x);
+
+  // Each block starts from row=blockIdx.x and then processes row+gridDim.x, row+2*gridDim.x, ...
+  for (int64_t src_row = row_idx; src_row < graph_rows; src_row += static_cast<int64_t>(gridDim.x)) {
+    if (deleted_rows && deleted_rows[src_row] == 1) {
+      if (col_idx == 0) { atomicAdd(skipped_deleted_src_count, static_cast<uint32_t>(graph_cols)); }
+      continue;
+    }
+
+    for (int64_t col = col_idx; col < graph_cols; col += static_cast<int64_t>(blockDim.x)) {
+      auto off = static_cast<uint64_t>(src_row) * static_cast<uint64_t>(graph_cols) +
+                 static_cast<uint64_t>(col);
+      auto dst = graph[off];
+      if (static_cast<int64_t>(dst) >= graph_rows) {
+        atomicAdd(skipped_invalid_dst_count, 1U);
+        continue;
+      }
+      if (deleted_rows && deleted_rows[dst] == 1) {
+        atomicAdd(skipped_deleted_dst_count, 1U);
+        continue;
+      }
+
+      auto pos = atomicAdd(reverse_counts + dst, 1U);
+      if (static_cast<int64_t>(pos) >= reverse_graph_cols) {
+        atomicAdd(dropped_edges_count, 1U);
+        continue;
+      }
+
+      reverse_graph[static_cast<uint64_t>(dst) * static_cast<uint64_t>(reverse_graph_cols) + pos] =
+        static_cast<uint32_t>(src_row);
+    }
+  }
 }
 
 template<typename T>
@@ -101,9 +154,30 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
 
   if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
   if (col_idx >= static_cast<uint64_t>(params.graph_cols)) { return; }
-  // Mark this row as live (not deleted) now that it is being inserted.
-  // Only one thread per block needs to do this write.
- 
+  
+  // Pre-compute a fallback neighbor to pad invalid/out-of-range slots so the graph
+  // stays regular. Thread 0 scans the search results for the first valid live node
+  // and broadcasts it through shared memory to all threads in the block.
+  __shared__ uint32_t s_fallback_neighbor;
+  if (col_idx == 0) {
+   
+   if( params.deleted_rows[cur_row] == 0)
+   {
+    // This row is already live (not deleted) — no need to search for a fallback neighbor.
+    printf("[bang_insert_kernel1] WARNING: row %llu is already live (not deleted) before insertion; skipping fallback neighbor search.\n",
+           static_cast<unsigned long long>(cur_row));
+           return;
+   }
+
+   s_fallback_neighbor = UINT32_MAX; // sentinel: no valid fallback found yet
+    for (int k = 0; k < recall_at_k; ++k) {
+      auto nb = d_search_neighbors[row_idx * recall_at_k + k];
+      if (nb >= 0 && nb < params.graph_rows && params.deleted_rows[nb] != 1) {
+        s_fallback_neighbor = static_cast<uint32_t>(nb);
+        break;
+      }
+    }
+  }
 
   // First Step: copy d_insert_vectors to the appropriate location in the dataset 
   uint32_t dims_per_thread =  (vector_dim + blockDim.x - 1) / blockDim.x; // ceiling division to cover all dimensions
@@ -112,61 +186,55 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
   for (uint32_t cur_dim = threadIdx.x * dims_per_thread; cur_dim < vector_dim && cur_dim < (threadIdx.x + 1) * dims_per_thread; cur_dim++) {
     d_dataset_vectors[cur_row * vector_dim + cur_dim] = d_insert_vectors[row_idx * vector_dim + cur_dim];
   }
+  __syncthreads();
 
-  // Second Step: Update the adjacency list for the current row with the search neighbors returned by the search kernel and mark the distance thresholds for this row based on the search distances returned by the search kernel.
-  {
+  // Second Step: Update the adjacency list for the current row with the search neighbors
+  // returned by the search kernel.
+  // - col_idx < recall_at_k : use the actual search result; pad with fallback if invalid/deleted.
+  // - col_idx >= recall_at_k: no search result exists (OOB); pad with fallback to keep graph regular.
+  // Reverse graph is only updated for real valid neighbors, not padding writes, to avoid
+  // inflating the indegree of the fallback node.
+  if (static_cast<int64_t>(col_idx) < static_cast<int64_t>(recall_at_k)) {
     auto nbr_val = d_search_neighbors[(row_idx * recall_at_k) + col_idx];
-    // Only write valid neighbor IDs; skip CAGRA sentinels (UINT32_MAX) and out-of-range values.
-    if (nbr_val >= 0 && nbr_val < params.graph_rows) {
-      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] = 
-       static_cast<uint32_t>(nbr_val);
+    if (nbr_val >= 0 && nbr_val < params.graph_rows && params.deleted_rows[nbr_val] != 1) {
+      // Valid neighbor — write and update the reverse graph.
+      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] =
+        static_cast<uint32_t>(nbr_val);
+      auto pos = atomicAdd(params.reverse_counts + static_cast<uint32_t>(nbr_val), 1U);
+      if (static_cast<int64_t>(pos) >= params.reverse_graph_cols) {
+        printf("[bang_insert_kernel1] WARNING: reverse graph capacity exceeded for neighbor %u of inserted row %llu; some reverse edges may not be recorded.\n",
+               static_cast<uint32_t>(nbr_val), static_cast<unsigned long long>(cur_row));
+      } else {
+        params.reverse_graph[static_cast<uint64_t>(nbr_val) * static_cast<uint64_t>(params.reverse_graph_cols) + pos] =
+          static_cast<uint32_t>(cur_row);
+      }
+    } else if (s_fallback_neighbor != UINT32_MAX) {
+      // Invalid or deleted result — pad with fallback; no reverse graph update.
+      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] = s_fallback_neighbor;
     }
-    else
-    {
-      params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] = 0; // or some other default value indicating no neighbor
+    else {
+      // Invalid or deleted result and no fallback neighbor found — leave the slot as-is.
+       printf("[bang_insert_kernel1] WARNING: no valid neighbor found for inserted row %llu at col_idx %lld; leaving slot as-is.\n",
+              static_cast<unsigned long long>(cur_row), static_cast<long long>(col_idx));
     }
+    // else: no valid neighbor found at all — leave the slot as-is.
+  } else if (s_fallback_neighbor != UINT32_MAX) {
+    // Slot has no corresponding search result (graph_cols > recall_at_k) — pad to keep graph regular.
+    params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] = s_fallback_neighbor;
+  }
+  else
+  {
+    // Slot has no corresponding search result and no fallback neighbor found — leave the slot as-is.
+    printf("[bang_insert_kernel1] WARNING: no valid neighbor found for inserted row %llu at col_idx %lld; leaving slot as-is.\n",
+           static_cast<unsigned long long>(cur_row), static_cast<long long>(col_idx));
   }
   __syncthreads();
-  #if 0
-  // Third Step: for each neighbor identify the neighbors
-  // Mental mode of graph: row#|neighbor1 neighbor2 neighbor3 ...
-  for (int64_t col = static_cast<int64_t>(col_idx); col < params.graph_cols/2;
-       col += static_cast<int64_t>(blockDim.x)) {
-    auto cur_row_cur_neighbor = params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col];
-    // Guard against CAGRA sentinel values (e.g. UINT32_MAX) that can appear when
-    // the search cannot fill all k slots (graph degradation after concurrent inserts).
-    if (static_cast<int64_t>(cur_row_cur_neighbor) >= params.graph_rows) { continue; }
-    // Do not update rows that are also being inserted in this launch.
-    if (is_row_in_insert_batch(params, static_cast<uint64_t>(cur_row_cur_neighbor))) { continue; }
-    bool reverse_edge_added = false;
-    for (int64_t col2 = 0; col2 < params.graph_cols; col2++) {
-      auto neighbor_of_cur_row_cur_neighbor =
-        params.graph[(cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col2];
-      // scan the neighbours of cur_row
-      for (int64_t entry = 0; entry < params.graph_cols; entry++) {
-        if (params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + entry] == 
-        neighbor_of_cur_row_cur_neighbor) {
-          auto target_offset = (cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col2;
-          //auto old_val       = params.graph[target_offset];
-          // Preserve existing valid edges; only backfill empty/stale slots.
-          //if (is_invalid_or_deleted_neighbor(params, old_val)) 
-          {
-            params.graph[target_offset] =
-              cur_row;  // add cur_row as a neighbor to the neighbors of cur_row's neighbors
-            reverse_edge_added = true;
-            break;
-          }
-        }
-      }
-      if (reverse_edge_added) { break; } // no need to continue scanning cur_row_cur_neighbor if reverse edge is added
-    }
-  }
-  #endif
+
   //__syncthreads();
-   if (col_idx == 0) { params.deleted_rows[cur_row] = 0; }
+  // if (col_idx == 0) { params.deleted_rows[cur_row] = 0; }
   //__syncthreads();
+}
   
-}  
  template<typename T>
 __global__ void cuvs_bang_insert_kernel2(InsertKernelParams params)
 {
@@ -188,32 +256,119 @@ __global__ void cuvs_bang_insert_kernel2(InsertKernelParams params)
     // Guard against CAGRA sentinel values (e.g. UINT32_MAX) that can appear when
     // the search cannot fill all k slots (graph degradation after concurrent inserts).
     if (static_cast<int64_t>(cur_row_cur_neighbor) >= params.graph_rows) { continue; }
+    // Skip deleted neighbors — their adjacency lists must not be modified.
+    if (params.deleted_rows[cur_row_cur_neighbor] == 1) { continue; }
     // Do not update rows that are also being inserted in this launch.
-    if (is_row_in_insert_batch(params, static_cast<uint64_t>(cur_row_cur_neighbor))) { continue; }
+    if (is_row_in_insert_batch(params, static_cast<uint64_t>(cur_row_cur_neighbor))) 
+    {
+      // print warning
+      printf("[bang_insert_kernel2] WARNING: cur_row %llu has neighbor %u that is also being inserted; skipping reverse-edge update for this neighbor.\n",
+             static_cast<unsigned long long>(cur_row), static_cast<unsigned int>(cur_row_cur_neighbor)); 
+      continue; 
+    }
     bool reverse_edge_added = false;
     for (int64_t col2 = 0; col2 < params.graph_cols; col2++) {
       auto neighbor_of_cur_row_cur_neighbor =
         params.graph[(cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col2];
+      // Skip deleted or out-of-range shared-neighbor candidates — matching against them
+      // would fire the replacement on a dead node.
+      if (static_cast<int64_t>(neighbor_of_cur_row_cur_neighbor) >= params.graph_rows) { continue; }
+      if (params.deleted_rows[neighbor_of_cur_row_cur_neighbor] == 1) { continue; }
       // scan the neighbours of cur_row
       for (int64_t entry = 0; entry < params.graph_cols; entry++) {
+
         if (params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + entry] == 
         neighbor_of_cur_row_cur_neighbor) {
           auto target_offset = (cur_row_cur_neighbor * static_cast<uint64_t>(params.graph_cols)) + col2;
-          //auto old_val       = params.graph[target_offset];
-          // Preserve existing valid edges; only backfill empty/stale slots.
-          //if (is_invalid_or_deleted_neighbor(params, old_val)) 
+          auto target_ptr = params.graph + target_offset;
+
           {
-            params.graph[target_offset] =
-              cur_row;  // add cur_row as a neighbor to the neighbors of cur_row's neighbors
-            reverse_edge_added = true;
-            break;
+            auto previous_neighbor = atomicExch(target_ptr, static_cast<uint32_t>(cur_row));
+            if (previous_neighbor != static_cast<uint32_t>(cur_row)) {
+              reverse_edge_added = true;
+
+              // Remove the old reverse link for the overwritten forward edge, if any.
+              if (static_cast<int64_t>(previous_neighbor) < params.graph_rows &&
+                  params.deleted_rows[previous_neighbor] != 1) {
+                int64_t prev_count = min(static_cast<int64_t>(params.reverse_counts[previous_neighbor]),
+                                         params.reverse_graph_cols);
+                for (int64_t c4 = 0; c4 < prev_count; ++c4) {
+                  auto off4 = previous_neighbor * static_cast<uint64_t>(params.reverse_graph_cols) + c4;
+                  if (params.reverse_graph[off4] == cur_row_cur_neighbor) {
+                    params.reverse_graph[off4] = UINT32_MAX;
+                    break;
+                  }
+                }
+              }
+
+              // cur_row_cur_neighbor now has a forward edge to cur_row, so cur_row_cur_neighbor
+              // is a new in-neighbor of cur_row — record it in the reverse graph.
+              auto pos = atomicAdd(params.reverse_counts + static_cast<uint32_t>(cur_row), 1U);
+              if (static_cast<int64_t>(pos) >= params.reverse_graph_cols) {
+                printf("[bang_insert_kernel2] WARNING: reverse graph capacity exceeded for cur_row %llu; some reverse edges may not be recorded.\n",
+                       static_cast<unsigned long long>(cur_row));
+                continue;
+              } else {
+                params.reverse_graph[static_cast<uint64_t>(cur_row) * static_cast<uint64_t>(params.reverse_graph_cols) + pos] =
+                  static_cast<uint32_t>(cur_row_cur_neighbor); // cur_row_cur_neighbor -> cur_row edge was just added
+              }
+            }
+
+          // remove cur_row_cur_neighbor from IN Nodes of neighbor_of_cur_row_cur_neighbor
+          for (int64_t c3 = 0; c3 < params.reverse_counts[neighbor_of_cur_row_cur_neighbor]; c3++) {
+            auto off3 = neighbor_of_cur_row_cur_neighbor * static_cast<uint64_t>(params.reverse_graph_cols) + c3;
+            if (params.reverse_graph[off3] == cur_row_cur_neighbor) {
+              // Set it with sentinel value (UINT32_MAX) to indicate that this edge has been removed. This is a common practice to avoid shifting elements in an array.   
+              params.reverse_graph[off3] = UINT32_MAX;
+                      break;
+            }
           }
-        }
+
+          break;
+          }
+        } // if (params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + entry] == neighbor_of_cur_row_cur_neighbor)
       }
       if (reverse_edge_added) { break; } // no need to continue scanning cur_row_cur_neighbor if reverse edge is added
     }
   }
-  
+  if (col_idx == 0) { params.deleted_rows[cur_row] = 0; }
+}
+ template<typename T>
+__global__ void cuvs_bang_insert_kernel3(InsertKernelParams params)
+{
+// Compact the reverse graph: remove UINT32_MAX sentinels that were introduced
+  // when edges were logically removed (e.g. in kernel2's reverse-edge cleanup).
+  // Each block handles one or more rows in a row-stride pattern.
+  // Single-thread compaction per row — the array width (reverse_graph_cols) is
+  // small enough that sequential work per row is cheaper than a parallel scan.
+  auto row_idx = static_cast<int64_t>(blockIdx.x);
+
+  for (int64_t row = row_idx; row < params.graph_rows; row += static_cast<int64_t>(gridDim.x)) {
+    if (params.deleted_rows[row] == 1) { continue; }
+
+    // Cap at reverse_graph_cols: reverse_counts can overflow due to atomicAdd past
+    // the allocated slot limit (dropped edges during build / incremental updates).
+    int64_t count = min(static_cast<int64_t>(params.reverse_counts[row]),
+                        params.reverse_graph_cols);
+    if (count == 0) { continue; }
+
+    auto* row_ptr = params.reverse_graph +
+                    row * static_cast<uint64_t>(params.reverse_graph_cols);
+
+    // In-place compaction: slide valid entries to the front.
+    int64_t write_pos = 0;
+    for (int64_t read_pos = 0; read_pos < count; ++read_pos) {
+      if (row_ptr[read_pos] != UINT32_MAX) {
+        row_ptr[write_pos++] = row_ptr[read_pos];
+      }
+    }
+    // Fill the vacated tail with UINT32_MAX to keep the region clean.
+    for (int64_t p = write_pos; p < count; ++p) {
+      row_ptr[p] = UINT32_MAX;
+    }
+    // Update reverse_counts to reflect only valid entries.
+    params.reverse_counts[row] = static_cast<uint32_t>(write_pos);
+  }
 }
 
 template<typename T>
@@ -230,7 +385,10 @@ void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
                                     int vector_dim,
                                     const algo_base::index_type* d_search_neighbors,
                                     const float* d_search_distances,
-                                    int recall_at_k)
+                                    int recall_at_k,
+                                    uint32_t* reverse_graph,
+                                    int64_t reverse_graph_cols,
+                                    uint32_t* reverse_counts)
 {
   if (num_ids == 0) { return; }
   if (graph_rows <= 0 || graph_cols <= 0) { return; }
@@ -239,7 +397,10 @@ void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
   InsertKernelParams params{nullptr, num_ids, mutable_graph_ptr, graph_rows, graph_cols,
                             static_cast<uint8_t*>(d_deleted_rows->data()),
                             static_cast<float*>(d_distance_threshold1->data()),
-                            static_cast<float*>(d_distance_threshold2->data())};
+                            static_cast<float*>(d_distance_threshold2->data()),
+                            reverse_graph,
+                            reverse_graph_cols,
+                            reverse_counts};
 
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&params.row_num), num_ids * sizeof(uint64_t)));
   RAFT_CUDA_TRY(cudaMemcpy(params.row_num, ids, num_ids * sizeof(uint64_t), cudaMemcpyHostToDevice));
@@ -260,7 +421,27 @@ void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
   cuvs_bang_insert_kernel2<T><<<blocks, graph_cols/2>>>(params);
 
   RAFT_CUDA_TRY(cudaPeekAtLastError());
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
 
+  // The incremental reverse-graph updates in kernel1/kernel2 are performed by
+  // concurrent blocks whose separate append/remove steps are not ordered with
+  // respect to each other. Under concurrent inserts this can leave a reverse
+  // edge whose matching forward edge was overwritten by a later block (a
+  // reverse edge with no corresponding forward edge).
+  //
+  // The forward graph itself is written with atomicExch (last-writer-wins) and
+  // is therefore self-consistent once kernel2 completes. Rebuild the reverse
+  // graph from the final forward graph so the two are consistent by
+  // construction. This launcher zeroes reverse_graph/reverse_counts internally.
+  launch_cuvs_bang_build_reverse_graph_kernel(mutable_graph_ptr,
+                                              graph_rows,
+                                              graph_cols,
+                                              reverse_graph,
+                                              reverse_graph_cols,
+                                              params.deleted_rows,
+                                              reverse_counts);
+
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
 
   
@@ -290,8 +471,397 @@ __global__ void cuvs_bang_delete_kernel1(DeleteKernelParams params)
 
   // mark the current row as deleted 
   params.deleted_rows[cur_row] = 1;
-  __syncthreads();
 }  
+
+__global__ void cuvs_bang_delete_kernel2_reversegraph(DeleteKernelParams params)
+{
+  // Print graph dimensions once from thread 0 and also first and last row_num to be deleted
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("[bang_kernel] graph_rows=%lld graph_cols=%lld num_ids=%llu first_row=%llu last_row=%llu\n",
+           (long long)params.graph_rows, (long long)params.graph_cols, (unsigned long long)params.num_ids,
+           (unsigned long long)params.row_num[0], (unsigned long long)params.row_num[params.num_ids - 1]);
+  }
+
+  auto row_idx = blockIdx.x;
+  auto col_idx = threadIdx.x;
+  if (row_idx >= params.num_ids || col_idx >= params.graph_cols) { return; }
+
+  // identify the current row to be deleted by this thread-block
+  auto cur_row = params.row_num[row_idx];
+
+  if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
+
+  if (params.deleted_rows[cur_row] != 1) { return; } // skip if not marked deleted
+
+  // find a guaranteed non-deleted neighbour of cur_row to replace deleted-row references.
+  // Only thread 0 scans the adjacency list; all others wait at __syncthreads().
+  // Using uint32_t to match the graph element type; UINT32_MAX is the "not found" sentinel.
+  // s_in_count is saved here BEFORE zeroing reverse_counts so the loop can use the original count.
+  __shared__ uint32_t backup_replacement_neighbor;
+  __shared__ int64_t  s_in_count;
+  if (col_idx == 0) {
+    // Save the in-count BEFORE zeroing it — this is the critical fix.
+    // Cap at reverse_graph_cols because atomicAdd can push the count past the slot limit.
+    s_in_count = min(static_cast<int64_t>(params.reverse_counts[cur_row]),
+                     params.reverse_graph_cols);
+
+    backup_replacement_neighbor = UINT32_MAX; // sentinel: no valid backup found yet
+    for (int64_t c = 0; c < params.graph_cols; c++) {
+      uint32_t nb = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + c];
+      if (static_cast<int64_t>(nb) < params.graph_rows && params.deleted_rows[nb] != 1) {
+        backup_replacement_neighbor = nb;
+        break;
+      }
+    }
+    if (backup_replacement_neighbor == UINT32_MAX) {
+      printf("[bang_kernel] WARNING: No non-deleted neighbor found for deleted row %llu\n",
+             (unsigned long long)cur_row);
+    }
+
+    // Reset the reverse count — the row is logically gone.
+    params.reverse_counts[cur_row] = 0;
+  }
+
+  __syncthreads();
+
+  
+  // scan the reverse graph to find the IN nodes of current cur_row.
+  // Use s_in_count (saved before zeroing) — reading params.reverse_counts[cur_row]
+  // here would return 0 since thread 0 already zeroed it above.
+  for (int64_t col = col_idx; col < s_in_count; col += blockDim.x) {
+    uint32_t in_node = params.reverse_graph[cur_row * static_cast<uint64_t>(params.reverse_graph_cols) + col];
+    if (static_cast<int64_t>(in_node) >= params.graph_rows || params.deleted_rows[in_node] == 1) { continue; } // skip invalid or deleted in_nodes
+    // scan the adjacency list of in_node to find cur_row and replace it
+    for (int64_t c = 0; c < params.graph_cols; ++c) {
+      auto off      = in_node * static_cast<uint64_t>(params.graph_cols) + c;
+      auto neighbor = params.graph[off];
+      if (neighbor == cur_row) {
+        // Determine the replacement node and write it into the forward graph.
+        // Priority 1: cur_row's neighbor at the same column (spatially close).
+        // Priority 2: backup_replacement_neighbor (first live node in cur_row's adj list).
+        // Priority 3: in_node's own live neighbors — used when the entire deleted
+        //             row's adj list is within the same deletion batch (spatial cluster).
+        uint32_t replacement = UINT32_MAX;
+        uint32_t candidate = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + c];
+        if (static_cast<int64_t>(candidate) < params.graph_rows && params.deleted_rows[candidate] != 1) {
+          replacement = candidate;
+        } else if (backup_replacement_neighbor != UINT32_MAX) {
+          replacement = backup_replacement_neighbor;
+        } else {
+          // Both primary fallbacks are deleted — scan in_node's own adj list for any live node.
+          for (int64_t c_fb = 0; c_fb < params.graph_cols; ++c_fb) {
+            uint32_t fb = params.graph[in_node * static_cast<uint64_t>(params.graph_cols) + c_fb];
+            if (static_cast<int64_t>(fb) < params.graph_rows && fb != cur_row &&
+                params.deleted_rows[fb] != 1) {
+              replacement = fb;
+              break;
+            }
+          }
+          if (replacement == UINT32_MAX) {
+            printf("[bang_kernel] WARNING: No live replacement found for in_node %llu -> cur_row %llu; edge left unchanged.\n",
+                   (unsigned long long)in_node, (unsigned long long)cur_row);
+          }
+        }
+
+        if (replacement != UINT32_MAX) {
+          // forward graph update
+          params.graph[off] = replacement;
+          // Scan replacement's reverse list for cur_row and replace it with in_node.
+          // Cap the count: reverse_counts can overflow past reverse_graph_cols.
+          bool reverse_entry_updated = false;
+          int64_t repl_count = min(static_cast<int64_t>(params.reverse_counts[replacement]),
+                                   params.reverse_graph_cols);
+          for (int64_t c2 = 0; c2 < repl_count; c2++) {
+            auto off2 = replacement * static_cast<uint64_t>(params.reverse_graph_cols) + c2;
+            if (params.reverse_graph[off2] == cur_row)
+            {
+              if (in_node == 20284) {
+                printf("[bang_kernel] Replacing reverse graph entry for replacement %u and cur_row %llu with in_node %llu\n",
+                       replacement, (unsigned long long)cur_row, (unsigned long long)in_node);
+              }
+              params.reverse_graph[off2] = in_node;
+              reverse_entry_updated = true;
+              break;
+            }
+          }
+
+          // If cur_row was not present in replacement's reverse row (already compacted/overwritten),
+          // append a new reverse edge entry so reverse graph remains consistent with the forward edge.
+          if (!reverse_entry_updated) {
+            auto pos = atomicAdd(params.reverse_counts + replacement, 1U);
+            if (static_cast<int64_t>(pos) < params.reverse_graph_cols) {
+              params.reverse_graph[replacement * static_cast<uint64_t>(params.reverse_graph_cols) + pos] =
+                in_node;
+            } else {
+              /*
+              printf("[bang_kernel] WARNING: reverse graph capacity exceeded while appending replacement %u <- in_node %llu (cur_row %llu)\n",
+                     replacement,
+                     (unsigned long long)in_node,
+                     (unsigned long long)cur_row);*/
+            }
+          }
+        }
+        else
+        {
+          printf("[bang_kernel] WARNING: No live replacement found for in_node %llu -> cur_row %llu; edge left unchanged.\n",
+                 (unsigned long long)in_node, (unsigned long long)cur_row);
+        }
+    }
+  }
+}
+}
+
+
+
+
+__global__ void cuvs_bang_delete_kernel2_naive(DeleteKernelParams params)
+{
+  // Print graph dimensions once from thread 0 and also first and last row_num to be deleted
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("[bang_kernel] graph_rows=%lld graph_cols=%lld num_ids=%llu first_row=%llu last_row=%llu\n",
+           (long long)params.graph_rows, (long long)params.graph_cols, (unsigned long long)params.num_ids,
+           (unsigned long long)params.row_num[0], (unsigned long long)params.row_num[params.num_ids - 1]);
+  }
+
+  auto row_idx = blockIdx.x;
+  auto col_idx = threadIdx.x;
+  if (row_idx >= params.num_ids || col_idx >= params.graph_cols) { return; }
+
+  // identify the current row to be deleted by this thread-block
+  auto cur_row = params.row_num[row_idx];
+
+  if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
+
+  if (params.deleted_rows[cur_row] != 1) { return; } // skip if not marked deleted
+
+  // find a guaranteed non-deleted neighbour of cur_row to replace deleted-row references.
+  // Only thread 0 scans the adjacency list; all others wait at __syncthreads().
+  // Using uint32_t to match the graph element type; UINT32_MAX is the "not found" sentinel.
+  __shared__ uint32_t backup_replacement_neighbor ;
+  if (col_idx == 0) {
+    backup_replacement_neighbor = UINT32_MAX; // sentinel: no valid backup found yet
+    for (int64_t c = 0; c < params.graph_cols; c++) {
+      uint32_t nb = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + c];
+      if (static_cast<int64_t>(nb) < params.graph_rows && params.deleted_rows[nb] != 1) {
+        backup_replacement_neighbor = nb;
+        break;
+      }
+    }
+    if (backup_replacement_neighbor == UINT32_MAX) {
+      printf("[bang_kernel] WARNING: No non-deleted neighbor found for deleted row %llu\n",
+             (unsigned long long)cur_row);
+    }
+  }
+
+  __syncthreads();
+
+  //uint32_t circular_counter = 0;
+  // scan the entire graph to find the occurrence of cur_row
+  for (int64_t col = col_idx; col < params.graph_cols; col += blockDim.x) {
+  for (int64_t row = 0; row < params.graph_rows; row++) {
+    if (params.deleted_rows[row] == 1)  { continue; } // skip deleted rows
+
+    
+      auto neighbor = params.graph[row * static_cast<uint64_t>(params.graph_cols) + col];
+      if (neighbor == cur_row) {
+        
+        
+        //uint32_t cur_row_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + circular_counter];
+        //if (params.deleted_rows[cur_row_neighbour] != 1){
+          // Replace the deleted-node reference with a live neighbor from the deleted row.
+          {
+            uint32_t candidate = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + col];
+            if (static_cast<int64_t>(candidate) < params.graph_rows && params.deleted_rows[candidate] != 1) {
+              params.graph[row * static_cast<uint64_t>(params.graph_cols) + col] = candidate;
+            } else if (backup_replacement_neighbor != UINT32_MAX) {
+              params.graph[row * static_cast<uint64_t>(params.graph_cols) + col] = backup_replacement_neighbor;
+            }
+            // else: no live node available; leave the slot as-is (graph is severely degraded)
+          }
+
+
+          // NOTE: no break here — multiple rows can have cur_row at the same column
+          // position, so we must continue scanning all rows for this column.
+          //cur_row_neighbour;
+          //if (++circular_counter >= params.graph_cols ) circular_counter = 0;
+        //  break; // go to next neighbor
+        //} else {
+        //    if (++circular_counter >= params.graph_cols ) circular_counter = 0;
+        //}
+      
+      } // end if neighbor match
+    }  // end for cols  
+  } // end for rows
+
+    #if 0
+      uint32_t temp_iter = 0;
+      while (temp_iter++ < params.graph_cols-1) {
+        uint32_t cur_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + temp_iter];
+        if (params.deleted_rows[cur_neighbour] != 1) {
+          // Copy adjacency list of a live neighbor into the deleted row.
+          for (int64_t col = 0; col < params.graph_cols; col++) {
+            uint32_t candidate = params.graph[cur_neighbour * static_cast<uint64_t>(params.graph_cols) + col];
+            if ((params.deleted_rows[candidate] != 1)) {
+              params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col] = candidate;
+            } else {
+              params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + col] = 1;
+            }
+          }
+          break;
+        }
+      } // end while
+    #endif
+}
+
+
+
+
+void cuvs_bang_kernel_init()
+{
+
+}
+
+void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
+                                                 int64_t graph_rows,
+                                                 int64_t graph_cols,
+                                                 uint32_t* reverse_graph,
+                                                 int64_t reverse_graph_cols,
+                                                 const uint8_t* deleted_rows,
+                                                 uint32_t* reverse_counts)
+{
+  if (!graph || !reverse_graph || !reverse_counts) { return; }
+  if (graph_rows <= 0 || graph_cols <= 0 || reverse_graph_cols <= 0) { return; }
+
+  auto reverse_elems = static_cast<uint64_t>(graph_rows) * static_cast<uint64_t>(reverse_graph_cols);
+  RAFT_CUDA_TRY(cudaMemset(reverse_graph, 0, reverse_elems * sizeof(uint32_t)));
+
+  uint32_t* d_dropped_edges  = nullptr;
+  uint32_t* d_skipped_invalid_dst = nullptr;
+  uint32_t* d_skipped_deleted_src = nullptr;
+  uint32_t* d_skipped_deleted_dst = nullptr;
+  RAFT_CUDA_TRY(cudaMemset(reverse_counts, 0, static_cast<size_t>(graph_rows) * sizeof(uint32_t)));
+
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_dropped_edges), sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_skipped_invalid_dst), sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_skipped_deleted_src), sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_skipped_deleted_dst), sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMemset(d_dropped_edges, 0, sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMemset(d_skipped_invalid_dst, 0, sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMemset(d_skipped_deleted_src, 0, sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMemset(d_skipped_deleted_dst, 0, sizeof(uint32_t)));
+
+  uint32_t threads = static_cast<uint32_t>(graph_cols > 1024 ? 1024 : graph_cols);
+  if (threads == 0) {
+    RAFT_CUDA_TRY(cudaFree(d_dropped_edges));
+    RAFT_CUDA_TRY(cudaFree(d_skipped_invalid_dst));
+    RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_src));
+    RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_dst));
+    return;
+  }
+
+  constexpr uint32_t kMaxBlocks = 10000;
+  auto blocks = static_cast<uint32_t>(graph_rows < static_cast<int64_t>(kMaxBlocks)
+                                        ? graph_rows
+                                        : static_cast<int64_t>(kMaxBlocks));
+  if (blocks == 0) {
+    RAFT_CUDA_TRY(cudaFree(d_dropped_edges));
+    RAFT_CUDA_TRY(cudaFree(d_skipped_invalid_dst));
+    RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_src));
+    RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_dst));
+    return;
+  }
+
+  cuvs_bang_build_reverse_graph_kernel<<<blocks, threads>>>(graph,
+                                                             graph_rows,
+                                                             graph_cols,
+                                                             reverse_graph,
+                                                             reverse_graph_cols,
+                                                             deleted_rows,
+                                                             reverse_counts,
+                                                             d_dropped_edges,
+                                                             d_skipped_invalid_dst,
+                                                             d_skipped_deleted_src,
+                                                             d_skipped_deleted_dst);
+
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+
+  uint32_t h_dropped_edges = 0;
+  uint32_t h_skipped_invalid_dst = 0;
+  uint32_t h_skipped_deleted_src = 0;
+  uint32_t h_skipped_deleted_dst = 0;
+  RAFT_CUDA_TRY(cudaMemcpy(
+    &h_dropped_edges, d_dropped_edges, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(cudaMemcpy(
+    &h_skipped_invalid_dst, d_skipped_invalid_dst, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(cudaMemcpy(
+    &h_skipped_deleted_src, d_skipped_deleted_src, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(cudaMemcpy(
+    &h_skipped_deleted_dst, d_skipped_deleted_dst, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  if (h_skipped_invalid_dst > 0 || h_skipped_deleted_src > 0 || h_skipped_deleted_dst > 0) {
+    std::printf(
+      "[bang] reverse_graph build skipped invalid_dst=%u deleted_src=%u deleted_dst=%u (rows=%lld fwd_cols=%lld rev_cols=%lld)\n",
+      h_skipped_invalid_dst,
+      h_skipped_deleted_src,
+      h_skipped_deleted_dst,
+      static_cast<long long>(graph_rows),
+      static_cast<long long>(graph_cols),
+      static_cast<long long>(reverse_graph_cols));
+  }
+  if (h_dropped_edges > 0) {
+    std::printf("[bang] reverse_graph build dropped=%u edges due to capacity (rows=%lld fwd_cols=%lld rev_cols=%lld)\n",
+                h_dropped_edges,
+                static_cast<long long>(graph_rows),
+                static_cast<long long>(graph_cols),
+                static_cast<long long>(reverse_graph_cols));
+  }
+
+  RAFT_CUDA_TRY(cudaFree(d_dropped_edges));
+  RAFT_CUDA_TRY(cudaFree(d_skipped_invalid_dst));
+  RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_src));
+  RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_dst));
+}
+
+
+void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
+                                    size_t num_ids,
+                                    const uint32_t* graph_ptr,
+                                    int64_t graph_rows,
+                                    int64_t graph_cols,
+                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
+                                    uint32_t* reverse_graph,
+                                    int64_t reverse_graph_cols,
+                                    uint32_t* reverse_counts)
+{
+  if (num_ids == 0) { return; }
+  if (graph_rows <= 0 || graph_cols <= 0) { return; }
+  auto* mutable_graph_ptr = const_cast<uint32_t*>(graph_ptr);
+  DeleteKernelParams params{nullptr, num_ids, mutable_graph_ptr, graph_rows, graph_cols,
+                            static_cast<uint8_t*>(d_deleted_rows->data()),
+                            reverse_graph,
+                            reverse_graph_cols,
+                            reverse_counts};
+
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&params.row_num), num_ids * sizeof(uint64_t)));
+  RAFT_CUDA_TRY(cudaMemcpy(params.row_num, ids, num_ids * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+  constexpr uint32_t threads = 1024;
+  auto blocks                = static_cast<uint32_t>((num_ids + threads - 1) / threads);
+
+  cuvs_bang_delete_kernel1<<<blocks, threads>>>(params);
+
+  auto bfs_threads = static_cast<uint32_t>(graph_cols > 1024 ? 1024 : graph_cols);
+
+  cuvs_bang_delete_kernel2_reversegraph<<<num_ids, bfs_threads>>>(params);
+  
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+
+  std::printf("[bang] kernel processed=%zu ids\n", num_ids);
+
+  RAFT_CUDA_TRY(cudaFree(params.row_num));
+}
 
 
 
@@ -458,9 +1028,6 @@ __global__ void cuvs_bang_delete_kernel2_BFS_shm(DeleteKernelParams params,
 #endif
 }
 
-
-
-
 __global__ void cuvs_bang_delete_kernel2_BFS_shm_bkp(DeleteKernelParams params,
                                                  uint32_t* frontier_curr_all,
                                                  uint32_t* frontier_next_all,
@@ -583,178 +1150,6 @@ __global__ void cuvs_bang_delete_kernel2_BFS_shm_bkp(DeleteKernelParams params,
 
 }
 
-
-
-
-__global__ void cuvs_bang_delete_kernel2_naive(DeleteKernelParams params)
-{
-  // Print graph dimensions once from thread 0 and also first and last row_num to be deleted
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    printf("[bang_kernel] graph_rows=%lld graph_cols=%lld num_ids=%llu first_row=%llu last_row=%llu\n",
-           (long long)params.graph_rows, (long long)params.graph_cols, (unsigned long long)params.num_ids,
-           (unsigned long long)params.row_num[0], (unsigned long long)params.row_num[params.num_ids - 1]);
-  }
-
-  auto row_idx = blockIdx.x;
-  auto col_idx = threadIdx.x;
-  if (row_idx >= params.num_ids || col_idx >= params.graph_cols) { return; }
-
-  // identify the current row to be deleted by this thread-block
-  auto cur_row = params.row_num[row_idx];
-
-  if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
-
-  if (params.deleted_rows[cur_row] != 1) { return; } // skip if not marked deleted
-
-  // find a guaranteed non-deleted neighbour of cur_row to replace deleted-row references.
-  // Only thread 0 scans the adjacency list; all others wait at __syncthreads().
-  // Using uint32_t to match the graph element type; UINT32_MAX is the "not found" sentinel.
-  __shared__ uint32_t backup_replacement_neighbor ;
-  if (col_idx == 0) {
-    backup_replacement_neighbor = UINT32_MAX; // sentinel: no valid backup found yet
-    for (int64_t c = 0; c < params.graph_cols; c++) {
-      uint32_t nb = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + c];
-      if (static_cast<int64_t>(nb) < params.graph_rows && params.deleted_rows[nb] != 1) {
-        backup_replacement_neighbor = nb;
-        break;
-      }
-    }
-    if (backup_replacement_neighbor == UINT32_MAX) {
-      printf("[bang_kernel] WARNING: No non-deleted neighbor found for deleted row %llu\n",
-             (unsigned long long)cur_row);
-    }
-  }
-
-  __syncthreads();
-
-  //uint32_t circular_counter = 0;
-  // scan the entire graph to find the occurrence of cur_row
-  for (int64_t col = col_idx; col < params.graph_cols; col += blockDim.x) {
-  for (int64_t row = 0; row < params.graph_rows; row++) {
-    if (params.deleted_rows[row] == 1)  { continue; } // skip deleted rows
-
-    
-      auto neighbor = params.graph[row * static_cast<uint64_t>(params.graph_cols) + col];
-      if (neighbor == cur_row) {
-        
-        
-        //uint32_t cur_row_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + circular_counter];
-        //if (params.deleted_rows[cur_row_neighbour] != 1){
-          // Replace the deleted-node reference with a live neighbor from the deleted row.
-          {
-            uint32_t candidate = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + col];
-            if (static_cast<int64_t>(candidate) < params.graph_rows && params.deleted_rows[candidate] != 1) {
-              params.graph[row * static_cast<uint64_t>(params.graph_cols) + col] = candidate;
-            } else if (backup_replacement_neighbor != UINT32_MAX) {
-              params.graph[row * static_cast<uint64_t>(params.graph_cols) + col] = backup_replacement_neighbor;
-            }
-            // else: no live node available; leave the slot as-is (graph is severely degraded)
-          }
-
-
-          // NOTE: no break here — multiple rows can have cur_row at the same column
-          // position, so we must continue scanning all rows for this column.
-          //cur_row_neighbour;
-          //if (++circular_counter >= params.graph_cols ) circular_counter = 0;
-        //  break; // go to next neighbor
-        //} else {
-        //    if (++circular_counter >= params.graph_cols ) circular_counter = 0;
-        //}
-      
-      } // end if neighbor match
-    }  // end for cols  
-  } // end for rows
-
-    #if 0
-      uint32_t temp_iter = 0;
-      while (temp_iter++ < params.graph_cols-1) {
-        uint32_t cur_neighbour = params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + temp_iter];
-        if (params.deleted_rows[cur_neighbour] != 1) {
-          // Copy adjacency list of a live neighbor into the deleted row.
-          for (int64_t col = 0; col < params.graph_cols; col++) {
-            uint32_t candidate = params.graph[cur_neighbour * static_cast<uint64_t>(params.graph_cols) + col];
-            if ((params.deleted_rows[candidate] != 1)) {
-              params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col] = candidate;
-            } else {
-              params.graph[cur_row * static_cast<uint64_t>(params.graph_cols) + col] = 1;
-            }
-          }
-          break;
-        }
-      } // end while
-    #endif
-}
-
-
-
-
-void cuvs_bang_kernel_init()
-{
-
-}
-
-
-void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
-                                    size_t num_ids,
-                                    const uint32_t* graph_ptr,
-                                    int64_t graph_rows,
-                                    int64_t graph_cols,
-                                    const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
-                                    uint32_t* d_frontier_curr,
-                                    uint32_t* d_frontier_next,
-                                    int* d_frontier_size,
-                                    int* d_next_size,
-                                    int64_t frontier_capacity,
-                                    size_t max_workspace_ids)
-{
-  if (num_ids == 0) { return; }
-  if (graph_rows <= 0 || graph_cols <= 0) { return; }
-  if (!d_frontier_curr || !d_frontier_next || !d_frontier_size || !d_next_size) {
-    std::printf("[bang] delete kernel missing workspace buffers\n");
-    return;
-  }
-  if (num_ids > max_workspace_ids) {
-    std::printf("[bang] delete kernel workspace too small: num_ids=%zu max_ids=%zu\n",
-                num_ids,
-                max_workspace_ids);
-    return;
-  }
-  if (frontier_capacity <= 0) {
-    std::printf("[bang] delete kernel invalid frontier_capacity=%lld\n",
-                static_cast<long long>(frontier_capacity));
-    return;
-  }
-  
-  auto* mutable_graph_ptr = const_cast<uint32_t*>(graph_ptr);
-  DeleteKernelParams params{nullptr, num_ids, mutable_graph_ptr, graph_rows, graph_cols,
-                            static_cast<uint8_t*>(d_deleted_rows->data())};
-
-  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&params.row_num), num_ids * sizeof(uint64_t)));
-  RAFT_CUDA_TRY(cudaMemcpy(params.row_num, ids, num_ids * sizeof(uint64_t), cudaMemcpyHostToDevice));
-
-  constexpr uint32_t threads = 1024;
-  auto blocks                = static_cast<uint32_t>((num_ids + threads - 1) / threads);
-
-  cuvs_bang_delete_kernel1<<<blocks, threads>>>(params);
-
-  RAFT_CUDA_TRY(cudaMemset(d_frontier_size, 0, num_ids * sizeof(int)));
-  RAFT_CUDA_TRY(cudaMemset(d_next_size, 0, num_ids * sizeof(int)));
-
-  auto bfs_threads = static_cast<uint32_t>(graph_cols > 1024 ? 1024 : graph_cols);
-  cuvs_bang_delete_kernel2_BFS_shm<<<num_ids, bfs_threads>>>(params,
-                                                              d_frontier_curr,
-                                                              d_frontier_next,
-                                                              d_frontier_size,
-                                                              d_next_size,
-                                                              frontier_capacity);
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
-
-  RAFT_CUDA_TRY(cudaDeviceSynchronize());
-
-  std::printf("[bang] kernel processed=%zu ids\n", num_ids);
-
-  RAFT_CUDA_TRY(cudaFree(params.row_num));
-}
 // Explicit template instantiations for supported types
 template void launch_cuvs_bang_insert_kernel<float>(const uint64_t* ids,
                                                      size_t num_ids,
@@ -772,7 +1167,10 @@ template void launch_cuvs_bang_insert_kernel<float>(const uint64_t* ids,
                                                      int vector_dim,
                                                      const algo_base::index_type* d_search_neighbors,
                                                      const float* d_search_distances,
-                                                     int recall_at_k);
+                                                     int recall_at_k,
+                                                     uint32_t* reverse_graph,
+                                                     int64_t reverse_graph_cols,
+                                                     uint32_t* reverse_counts);
 
 template void launch_cuvs_bang_insert_kernel<half>(const uint64_t* ids,
                                                     size_t num_ids,
@@ -790,7 +1188,10 @@ template void launch_cuvs_bang_insert_kernel<half>(const uint64_t* ids,
                                                     int vector_dim,
                                                     const algo_base::index_type* d_search_neighbors,
                                                     const float* d_search_distances,
-                                                    int recall_at_k);
+                                                    int recall_at_k,
+                                                    uint32_t* reverse_graph,
+                                                    int64_t reverse_graph_cols,
+                                                    uint32_t* reverse_counts);
 
 template void launch_cuvs_bang_insert_kernel<int8_t>(const uint64_t* ids,
                                                       size_t num_ids,
@@ -808,7 +1209,10 @@ template void launch_cuvs_bang_insert_kernel<int8_t>(const uint64_t* ids,
                                                       int vector_dim,
                                                       const algo_base::index_type* d_search_neighbors,
                                                       const float* d_search_distances,
-                                                      int recall_at_k);
+                                                      int recall_at_k,
+                                                      uint32_t* reverse_graph,
+                                                      int64_t reverse_graph_cols,
+                                                      uint32_t* reverse_counts);
 
 template void launch_cuvs_bang_insert_kernel<uint8_t>(const uint64_t* ids,
                                                        size_t num_ids,
@@ -826,7 +1230,10 @@ template void launch_cuvs_bang_insert_kernel<uint8_t>(const uint64_t* ids,
                                                        int vector_dim,
                                                        const algo_base::index_type* d_search_neighbors,
                                                        const float* d_search_distances,
-                                                       int recall_at_k);
+                                                       int recall_at_k,
+                                                       uint32_t* reverse_graph,
+                                                       int64_t reverse_graph_cols,
+                                                       uint32_t* reverse_counts);
 
 
 }  // namespace cuvs::bench::detail

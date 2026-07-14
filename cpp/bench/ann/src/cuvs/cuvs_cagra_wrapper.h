@@ -65,7 +65,10 @@ void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
                                     int vector_dim,
                                     const algo_base::index_type* d_search_neighbors,
                                     const float* d_search_distances,
-                                    int recall_at_k);
+                                    int recall_at_k,
+                                    uint32_t* reverse_graph,
+                                    int64_t reverse_graph_cols,
+                                    uint32_t* reverse_counts);
 
 void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                     size_t num_ids,
@@ -73,12 +76,17 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                     int64_t graph_rows,
                                     int64_t graph_cols,
                                     const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
-                                    uint32_t* d_frontier_curr,
-                                    uint32_t* d_frontier_next,
-                                    int* d_frontier_size,
-                                    int* d_next_size,
-                                    int64_t frontier_capacity,
-                                    size_t max_workspace_ids);
+                                    uint32_t* reverse_graph,
+                                    int64_t reverse_graph_cols,
+                                    uint32_t* reverse_counts);
+
+void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
+                                                 int64_t graph_rows,
+                                                 int64_t graph_cols,
+                                                 uint32_t* reverse_graph,
+                                                 int64_t reverse_graph_cols,
+                                                 const uint8_t* deleted_rows,
+                                                 uint32_t* reverse_counts);
 }
 
 enum class AllocatorType { kHostPinned, kHostHugePage, kDevice };
@@ -129,6 +137,8 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
       dataset_(std::make_shared<raft::device_matrix<T, int64_t, raft::row_major>>(
         std::move(raft::make_device_matrix<T, int64_t>(handle_, 0, 0)))),
       graph_(std::make_shared<raft::device_matrix<IdxT, int64_t, raft::row_major>>(
+        std::move(raft::make_device_matrix<IdxT, int64_t>(handle_, 0, 0)))),
+      reverse_graph_(std::make_shared<raft::device_matrix<IdxT, int64_t, raft::row_major>>(
         std::move(raft::make_device_matrix<IdxT, int64_t>(handle_, 0, 0)))),
       input_dataset_v_(
         std::make_shared<raft::device_matrix_view<const T, int64_t, raft::row_major>>(
@@ -255,8 +265,11 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   std::optional<std::string> graph_file_;
   // START: For delete experiments
   std::shared_ptr<rmm::device_buffer> d_deleted_rows_;
+  std::shared_ptr<rmm::device_buffer> d_reverse_counts_;
   // END: For delete experiments
-  // Max rows the dataset can expand upto
+  // Adding a reverse graph to store the IN neighbors for each node
+  std::shared_ptr<raft::device_matrix<IdxT, int64_t, raft::row_major>> reverse_graph_; 
+  double reverse_graph_col_scale_{20};
   int rows_;
    // dataset size supplied at build time
   int build_rows_;
@@ -272,6 +285,24 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   size_t delete_workspace_max_ids_{0};
 
   void ensure_delete_workspace(size_t required_ids, int64_t graph_rows);
+
+  inline void ensure_reverse_counts_buffer(int64_t graph_rows)
+  {
+    if (graph_rows <= 0) { return; }
+    auto required_bytes = static_cast<size_t>(graph_rows) * sizeof(uint32_t);
+    if (!d_reverse_counts_ || d_reverse_counts_->size() < required_bytes) {
+      d_reverse_counts_ = std::make_shared<rmm::device_buffer>(
+        required_bytes, handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
+    }
+  }
+
+  [[nodiscard]] inline auto get_reverse_graph_cols(int64_t graph_cols) const -> int64_t
+  {
+    if (graph_cols <= 0) { return 0; }
+    auto scaled_cols = static_cast<int64_t>(std::ceil(static_cast<double>(graph_cols) *
+                                                      reverse_graph_col_scale_));
+    return std::max<int64_t>(graph_cols, scaled_cols);
+  }
 
   inline rmm::device_async_resource_ref get_mr(AllocatorType mem_type)
   {
@@ -530,6 +561,19 @@ void cuvs_cagra<T, IdxT>::preprocess_built_index()
       handle_, get_mr(graph_mem_), raft::make_extents<int64_t>(rows, cols));
   }
 
+  auto reverse_cols = get_reverse_graph_cols(cols);
+  if (!reverse_graph_ || reverse_graph_->extent(0) != rows ||
+      reverse_graph_->extent(1) != reverse_cols) {
+    *reverse_graph_ = raft::make_device_mdarray<IdxT, int64_t>(
+      handle_, get_mr(graph_mem_), raft::make_extents<int64_t>(rows, reverse_cols));
+    if (rows > 0 && reverse_cols > 0) {
+      RAFT_CUDA_TRY(cudaMemsetAsync(reverse_graph_->data_handle(),
+                                    0,
+                                    static_cast<size_t>(rows * reverse_cols) * sizeof(IdxT),
+                                    stream));
+    }
+  }
+
   raft::copy(graph_->data_handle(), host_graph.data(), host_graph.size(), stream);
   raft::resource::sync_stream(handle_);
   index_->update_graph(handle_, make_const_mdspan(graph_->view()));
@@ -569,8 +613,27 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
                old_graph.data_handle(),
                old_graph.size(),
                raft::resource::get_cuda_stream(handle_));
+
+    auto reverse_cols = get_reverse_graph_cols(old_graph.extent(1));
+    auto new_reverse_graph =
+      raft::make_device_mdarray<IdxT, int64_t>(
+        handle_, mr, raft::make_extents<int64_t>(old_graph.extent(0), reverse_cols));
+    if (reverse_graph_ && reverse_graph_->extent(0) == old_graph.extent(0) &&
+        reverse_graph_->extent(1) == reverse_cols) {
+      raft::copy(new_reverse_graph.data_handle(),
+                 reverse_graph_->data_handle(),
+                 reverse_graph_->size(),
+                 raft::resource::get_cuda_stream(handle_));
+    } else if (old_graph.extent(0) > 0 && reverse_cols > 0) {
+      RAFT_CUDA_TRY(cudaMemsetAsync(new_reverse_graph.data_handle(),
+                                    0,
+                                    static_cast<size_t>(old_graph.extent(0) * reverse_cols) *
+                                      sizeof(IdxT),
+                                    raft::resource::get_cuda_stream(handle_)));
+    }
     raft::resource::sync_stream(handle_);
     *graph_ = std::move(new_graph);
+    *reverse_graph_ = std::move(new_reverse_graph);
 
     // NB: update_graph() only stores a view in the index. We need to keep the graph object alive.
     index_->update_graph(handle_, make_const_mdspan(graph_->view()));
@@ -769,12 +832,23 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
   if (old_rows < target_rows) {
     auto mr                 = get_mr(graph_mem_);
     auto stream             = raft::resource::get_cuda_stream(handle_);
+    auto reverse_cols       = get_reverse_graph_cols(cols);
     auto new_expanded_graph = raft::make_device_mdarray<IdxT, int64_t>(
       handle_, mr, raft::make_extents<int64_t>(target_rows, cols));
+    auto new_expanded_reverse_graph = raft::make_device_mdarray<IdxT, int64_t>(
+      handle_, mr, raft::make_extents<int64_t>(target_rows, reverse_cols));
 
     if (old_rows > 0) {
       raft::copy(
         new_expanded_graph.data_handle(), old_graph.data_handle(), old_graph.size(), stream);
+
+      if (reverse_graph_ && reverse_graph_->extent(0) == old_rows &&
+          reverse_graph_->extent(1) == reverse_cols) {
+        raft::copy(new_expanded_reverse_graph.data_handle(),
+                   reverse_graph_->data_handle(),
+                   reverse_graph_->size(),
+                   stream);
+      }
     }
 
     // Zero-initialize the tail rows [old_rows, target_rows).
@@ -783,11 +857,22 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
     // computes distances against invalid dataset addresses → OOB illegal access.
     auto tail_offset = static_cast<size_t>(old_rows) * static_cast<size_t>(cols);
     auto tail_elems  = static_cast<size_t>(target_rows - old_rows) * static_cast<size_t>(cols);
+    auto reverse_tail_offset = static_cast<size_t>(old_rows) * static_cast<size_t>(reverse_cols);
+    auto reverse_tail_elems  = static_cast<size_t>(target_rows - old_rows) *
+                              static_cast<size_t>(reverse_cols);
     if (tail_elems > 0) {
       RAFT_CUDA_TRY(cudaMemsetAsync(
         new_expanded_graph.data_handle() + tail_offset,
         0,
         tail_elems * sizeof(IdxT),
+        stream));
+    }
+
+    if (reverse_tail_elems > 0) {
+      RAFT_CUDA_TRY(cudaMemsetAsync(
+        new_expanded_reverse_graph.data_handle() + reverse_tail_offset,
+        0,
+        reverse_tail_elems * sizeof(IdxT),
         stream));
     }
     raft::resource::sync_stream(handle_);
@@ -797,6 +882,7 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
               << " zeroed_tail_elems=" << tail_elems << std::endl;
 
     *graph_ = std::move(new_expanded_graph);
+    *reverse_graph_ = std::move(new_expanded_reverse_graph);
     index_->update_graph(handle_, make_const_mdspan(graph_->view()));
 
   #if 0
@@ -849,6 +935,55 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
 
       d_dist_threshold1_ = new_dist_threshold1;
       d_dist_threshold2_ = new_dist_threshold2;
+    }
+#endif
+  }
+
+  // set_search_dataset is the canonical place where reverse-graph rebuild is triggered.
+  static_assert(sizeof(IdxT) == sizeof(uint32_t),
+                "IdxT must be uint32_t for launch_cuvs_bang_build_reverse_graph_kernel");
+  auto curr_graph = index_->graph();
+  auto curr_rows  = curr_graph.extent(0);
+  auto curr_cols  = curr_graph.extent(1);
+  if (curr_rows > 0 && curr_cols > 0) {
+    auto reverse_cols = get_reverse_graph_cols(curr_cols);
+    if (!reverse_graph_ || reverse_graph_->extent(0) != curr_rows ||
+        reverse_graph_->extent(1) != reverse_cols) {
+      *reverse_graph_ = raft::make_device_mdarray<IdxT, int64_t>(
+        handle_, get_mr(graph_mem_), raft::make_extents<int64_t>(curr_rows, reverse_cols));
+    }
+
+    ensure_reverse_counts_buffer(curr_rows);
+    detail::launch_cuvs_bang_build_reverse_graph_kernel(
+      reinterpret_cast<const uint32_t*>(curr_graph.data_handle()),
+      curr_rows,
+      curr_cols,
+      reinterpret_cast<uint32_t*>(reverse_graph_->data_handle()),
+      reverse_cols,
+      d_deleted_rows_ ? static_cast<const uint8_t*>(d_deleted_rows_->data()) : nullptr,
+      static_cast<uint32_t*>(d_reverse_counts_->data()));
+
+    // Persist reverse graph after rebuild.
+    std::string reverse_graph_file =
+      (graph_file_ && !graph_file_->empty()) ? (*graph_file_ + ".reverse_graph.bin")
+                                             : std::string("reverse_graph.bin");
+    std::vector<IdxT> host_reverse_graph(static_cast<size_t>(curr_rows * reverse_cols));
+    raft::copy(host_reverse_graph.data(),
+               reverse_graph_->data_handle(),
+               host_reverse_graph.size(),
+               stream);
+    raft::resource::sync_stream(handle_);
+#if 0
+    std::ofstream reverse_out(reverse_graph_file, std::ios::binary | std::ios::trunc);
+    if (reverse_out.good()) {
+      reverse_out.write(reinterpret_cast<const char*>(&curr_rows), sizeof(curr_rows));
+      reverse_out.write(reinterpret_cast<const char*>(&reverse_cols), sizeof(reverse_cols));
+      reverse_out.write(reinterpret_cast<const char*>(host_reverse_graph.data()),
+                        static_cast<std::streamsize>(host_reverse_graph.size() * sizeof(IdxT)));
+      reverse_out.close();
+    } else {
+      std::cerr << "Warning: failed to save reverse graph file to " << reverse_graph_file
+                << std::endl;
     }
 #endif
   }
@@ -994,12 +1129,13 @@ template <typename T, typename IdxT>
 void cuvs_cagra<T, IdxT>::set_insert_param(const insert_param& param)
 {
   insert_params_ = param;
-
+#if 0
   auto graph_rows = index_ ? index_->graph().extent(0) : static_cast<int64_t>(rows_);
   auto warmup_ids = param.max_chunk_size > 0 ? static_cast<size_t>(param.max_chunk_size) : size_t{0};
   if (warmup_ids > 0 && graph_rows > 0) {
     ensure_delete_workspace(warmup_ids, graph_rows);
   }
+#endif
 }
 
 template <typename T, typename IdxT>
@@ -1660,7 +1796,10 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
                                          dim_,
                                         neighbors,
                                         distances,
-                                        k);
+                                        k,
+                                        reverse_graph_ ? reinterpret_cast<uint32_t*>(reverse_graph_->data_handle()) : nullptr,
+                                        reverse_graph_ ? reverse_graph_->extent(1) : int64_t{0},
+                                        d_reverse_counts_ ? static_cast<uint32_t*>(d_reverse_counts_->data()) : nullptr);
 
   std::cout << "[insert] complete: old_rows=" 
             /*<< old_rows
@@ -1671,12 +1810,43 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
             << std::endl;
 
  // save index
+ #if 0
    if (insert_params_.persist && graph_file_.has_value() && !graph_file_->empty()) {
       save(*graph_file_+"_after_10kinsert");
       std::cout << "[insert] persisted updated index to " << *graph_file_+"_after_10kinsert" << std::endl;
-    }            
+    } 
+ #endif     
+ // print the reverse graph for debugging
+ #if 0
+   auto curr_graph = index_->graph();
+  auto curr_rows  = curr_graph.extent(0);
+  auto curr_cols  = curr_graph.extent(1);
+  auto reverse_cols       = get_reverse_graph_cols(curr_cols);
+  if (reverse_graph_) {
+    auto reverse_graph_view = reverse_graph_->view();
+    std::vector<uint32_t> host_reverse_graph(static_cast<size_t>(reverse_graph_view.extent(0) * reverse_graph_view.extent(1)));
+    raft::copy(host_reverse_graph.data(),
+               reverse_graph_view.data_handle(),
+               static_cast<size_t>(reverse_graph_view.extent(0) * reverse_graph_view.extent(1)),
+               raft::resource::get_cuda_stream(handle_));
+    raft::resource::sync_stream(handle_);
+        std::string reverse_graph_file =
+      (graph_file_ && !graph_file_->empty()) ? (*graph_file_ + ".reverse_graph_insert.bin")
+                                             : std::string("reverse_graph.bin");
+  std::ofstream reverse_out(reverse_graph_file, std::ios::binary | std::ios::trunc);
+    if (reverse_out.good()) {
+      reverse_out.write(reinterpret_cast<const char*>(&curr_rows), sizeof(curr_rows));
+      reverse_out.write(reinterpret_cast<const char*>(&reverse_cols), sizeof(reverse_cols));
+      reverse_out.write(reinterpret_cast<const char*>(host_reverse_graph.data()),
+                        static_cast<std::streamsize>(host_reverse_graph.size() * sizeof(IdxT)));
+      reverse_out.close();
+    } else {
+      std::cerr << "Warning: failed to save reverse graph file to " << reverse_graph_file
+                << std::endl;
+    }
+  }
+  #endif
 }
-
 
 template <typename T, typename IdxT>  
 void cuvs_cagra<T, IdxT>::delete_vectors(const uint64_t* ids, size_t num_ids)
@@ -1708,8 +1878,9 @@ void cuvs_cagra<T, IdxT>::delete_vectors(const uint64_t* ids, size_t num_ids)
     cached_graph_ptr,
     (long long)cached_graph_rows,
     (long long)cached_graph_cols);
-
+#if 0
   ensure_delete_workspace(num_ids, graph_rows);
+#endif
 
   #if 1
     detail::launch_cuvs_bang_delete_kernel(
@@ -1719,18 +1890,55 @@ void cuvs_cagra<T, IdxT>::delete_vectors(const uint64_t* ids, size_t num_ids)
       graph_rows,
       graph_cols,
       d_deleted_rows_,
+      reverse_graph_ ? reinterpret_cast<uint32_t*>(reverse_graph_->data_handle()) : nullptr,
+      reverse_graph_ ? reverse_graph_->extent(1) : int64_t{0},
+      d_reverse_counts_ ? static_cast<uint32_t*>(d_reverse_counts_->data()) : nullptr
+      #if 0
+      ,
       static_cast<uint32_t*>(d_delete_frontier_curr_->data()),
       static_cast<uint32_t*>(d_delete_frontier_next_->data()),
       static_cast<int*>(d_delete_frontier_size_->data()),
       static_cast<int*>(d_delete_next_size_->data()),
       delete_workspace_frontier_capacity_,
-      delete_workspace_max_ids_);
+      delete_workspace_max_ids_
+      #endif
+    );
   #endif
+
   // log the graph dimensions after deletion for debugging
   raft::resource::sync_stream(handle_);
   auto post_delete_graph_view = index_->graph();
   std::cout << "[delete_vectors] post-delete graph dimensions: rows=" << post_delete_graph_view.extent(0)
             << " cols=" << post_delete_graph_view.extent(1) << std::endl;
+#if 0
+ auto curr_graph = index_->graph();
+  auto curr_rows  = curr_graph.extent(0);
+  auto curr_cols  = curr_graph.extent(1);
+  auto reverse_cols       = get_reverse_graph_cols(curr_cols);
+  if (reverse_graph_) {
+    auto reverse_graph_view = reverse_graph_->view();
+    std::vector<uint32_t> host_reverse_graph(static_cast<size_t>(reverse_graph_view.extent(0) * reverse_graph_view.extent(1)));
+    raft::copy(host_reverse_graph.data(),
+               reverse_graph_view.data_handle(),
+               static_cast<size_t>(reverse_graph_view.extent(0) * reverse_graph_view.extent(1)),
+               raft::resource::get_cuda_stream(handle_));
+    raft::resource::sync_stream(handle_); 
+        std::string reverse_graph_file =
+      (graph_file_ && !graph_file_->empty()) ? (*graph_file_ + ".reverse_graph_delete.bin")
+                                             : std::string("reverse_graph.bin");
+  std::ofstream reverse_out(reverse_graph_file, std::ios::binary | std::ios::trunc);
+    if (reverse_out.good()) {
+      reverse_out.write(reinterpret_cast<const char*>(&curr_rows), sizeof(curr_rows));
+      reverse_out.write(reinterpret_cast<const char*>(&reverse_cols), sizeof(reverse_cols));
+      reverse_out.write(reinterpret_cast<const char*>(host_reverse_graph.data()),
+                        static_cast<std::streamsize>(host_reverse_graph.size() * sizeof(IdxT)));
+      reverse_out.close();
+    } else {
+      std::cerr << "Warning: failed to save reverse graph file to " << reverse_graph_file
+                << std::endl;
+    }
+  }
+  #endif            
 }
 
 /*
