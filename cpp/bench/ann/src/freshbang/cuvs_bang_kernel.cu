@@ -409,7 +409,7 @@ void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
   auto blocks      = static_cast<uint32_t>(num_ids);
 
   // copy the h_insert_vectrs to device
-  #if 1
+  
   T* d_insert_vectors;
   
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_insert_vectors), num_ids * vector_dim * sizeof(T)));
@@ -423,31 +423,8 @@ void launch_cuvs_bang_insert_kernel(const uint64_t* ids,
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
 
-  // The incremental reverse-graph updates in kernel1/kernel2 are performed by
-  // concurrent blocks whose separate append/remove steps are not ordered with
-  // respect to each other. Under concurrent inserts this can leave a reverse
-  // edge whose matching forward edge was overwritten by a later block (a
-  // reverse edge with no corresponding forward edge).
-  //
-  // The forward graph itself is written with atomicExch (last-writer-wins) and
-  // is therefore self-consistent once kernel2 completes. Rebuild the reverse
-  // graph from the final forward graph so the two are consistent by
-  // construction. This launcher zeroes reverse_graph/reverse_counts internally.
-  launch_cuvs_bang_build_reverse_graph_kernel(mutable_graph_ptr,
-                                              graph_rows,
-                                              graph_cols,
-                                              reverse_graph,
-                                              reverse_graph_cols,
-                                              params.deleted_rows,
-                                              reverse_counts);
-
-  RAFT_CUDA_TRY(cudaPeekAtLastError());
-  RAFT_CUDA_TRY(cudaDeviceSynchronize());
-
-  
-  RAFT_CUDA_TRY(cudaFree(params.row_num));  
+  RAFT_CUDA_TRY(cudaFree(params.row_num));
   RAFT_CUDA_TRY(cudaFree(d_insert_vectors));
-  #endif
 
   std::printf("[bang] insert kernel processed=%zu ids\n", num_ids);
 }
@@ -809,7 +786,7 @@ void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
       static_cast<long long>(reverse_graph_cols));
   }
   if (h_dropped_edges > 0) {
-    std::printf("[bang] reverse_graph build dropped=%u edges due to capacity (rows=%lld fwd_cols=%lld rev_cols=%lld)\n",
+    std::printf("[bang] WARNING: reverse_graph build dropped=%u edges due to capacity (rows=%lld fwd_cols=%lld rev_cols=%lld)\n",
                 h_dropped_edges,
                 static_cast<long long>(graph_rows),
                 static_cast<long long>(graph_cols),
@@ -844,6 +821,17 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
 
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&params.row_num), num_ids * sizeof(uint64_t)));
   RAFT_CUDA_TRY(cudaMemcpy(params.row_num, ids, num_ids * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+  // Reverse graph is only consumed by delete kernel2. Rebuild it from the
+  // current forward graph immediately before delete processing so kernel2 sees
+  // a fresh, consistent in-edge view.
+  launch_cuvs_bang_build_reverse_graph_kernel(mutable_graph_ptr,
+                                              graph_rows,
+                                              graph_cols,
+                                              reverse_graph,
+                                              reverse_graph_cols,
+                                              static_cast<uint8_t*>(d_deleted_rows->data()),
+                                              reverse_counts);
 
   constexpr uint32_t threads = 1024;
   auto blocks                = static_cast<uint32_t>((num_ids + threads - 1) / threads);

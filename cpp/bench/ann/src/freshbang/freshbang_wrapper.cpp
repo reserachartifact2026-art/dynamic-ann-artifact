@@ -814,7 +814,7 @@ void FreshBANG<T>::BatchedDelete(const uint64_t* ids, uint32_t batch_size)
   }
 
  algo_obj->delete_vectors(ids, static_cast<size_t>(batch_size));
-  std::cout << "[FreshBANG::BatchedDelete] delete() completed with index saved" << std::endl;
+  std::cout << "[FreshBANG::BatchedDelete] delete() completed" << std::endl;
 }
 
 template <typename T>
