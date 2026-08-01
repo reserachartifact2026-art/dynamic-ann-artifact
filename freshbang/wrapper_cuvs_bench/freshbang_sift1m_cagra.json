@@ -1,0 +1,41 @@
+{
+  "dataset": {
+    "name": "sift1m_v10",
+    "base_file": "sift-128-euclidean/base.fbin",
+    "query_file": "sift-128-euclidean/query.fbin",
+    "insert_file": "sift-128-euclidean/base.fbin",
+    "rows": 1000000,
+    "dims": 128,
+    "groundtruth_neighbors_file": "sift-128-euclidean/groundtruth.neighbors.ibin",
+    "distance": "euclidean"
+  },
+  "search_basic_param": {
+    "k": 10,
+    "batch_size": 10000,
+    "total_queries": 10000
+  },
+  "index": [
+    {
+      "algo": "cuvs_cagra",
+      "build_param": {
+        "graph_degree": 32,
+        "intermediate_graph_degree": 64,
+        "graph_build_algo": "NN_DESCENT"
+      },
+      "insert_param": {
+        "persist": false,
+        "refine_ratio": 1.0,
+        "graph_mem": "device",
+        "dataset_mem": "device"
+      },
+      "name": "freshbang_v10_sift1m",
+      "file": "freshbang_v10_sift1m",
+      "search_params": [
+        {
+          "itopk": 128,
+          "search_width": 1
+        }
+      ]
+    }
+  ]
+}

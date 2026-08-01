@@ -1,0 +1,14 @@
+{
+  "dataset": { "name": "v11", "rows": 1000000, "dims": 128, "distance": "euclidean" },
+  "search_basic_param": { "k": 10, "batch_size": 10000, "total_queries": 10000 },
+  "index": [
+    {
+      "algo": "cuvs_cagra",
+      "build_param": { "graph_degree": 32, "intermediate_graph_degree": 64, "graph_build_algo": "NN_DESCENT" },
+      "insert_param": { "persist": true, "refine_ratio": 1.0, "graph_mem": "device", "dataset_mem": "device" },
+      "name": "freshbang_v11",
+      "file": "freshbang_v11_index",
+      "search_params": [ { "itopk": 128, "search_width": 1 } ]
+    }
+  ]
+}
