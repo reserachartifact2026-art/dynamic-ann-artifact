@@ -1,0 +1,134 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include "../sample_filter.cuh"  // none_sample_filter
+#include "ivf_pq_fp_8bit.cuh"    // cuvs::neighbors::ivf_pq::detail::fp_8bit
+
+#include "ivf_pq_compute_similarity.hpp"  // cuvs::neighbors::ivf_pq::detail::selected
+#include <cuvs/distance/distance.hpp>     // cuvs::distance::DistanceType
+#include <cuvs/neighbors/common.hpp>
+#include <cuvs/neighbors/ivf_pq.hpp>    // cuvs::neighbors::ivf_pq::codebook_gen
+#include <raft/core/detail/macros.hpp>  // RAFT_WEAK_FUNCTION
+#include <rmm/cuda_stream_view.hpp>     // rmm::cuda_stream_view
+
+#include <cuda_fp16.h>  // __half
+
+namespace cuvs::neighbors::ivf_pq::detail {
+
+// is_local_topk_feasible is not inline here, because we would have to define it
+// here as well. That would run the risk of the definitions here and in the
+// -inl.cuh header diverging.
+auto RAFT_WEAK_FUNCTION is_local_topk_feasible(uint32_t k, uint32_t n_probes, uint32_t n_queries)
+  -> bool;
+
+template <typename OutT, typename LutT>
+void compute_similarity_run(selected<OutT, LutT> s,
+                            rmm::cuda_stream_view stream,
+                            uint32_t dim,
+                            uint32_t n_probes,
+                            uint32_t pq_dim,
+                            uint32_t n_queries,
+                            uint32_t queries_offset,
+                            distance::DistanceType metric,
+                            codebook_gen codebook_kind,
+                            uint32_t topk,
+                            uint32_t max_samples,
+                            const float* cluster_centers,
+                            const float* pq_centers,
+                            const uint8_t* const* pq_dataset,
+                            const uint32_t* cluster_labels,
+                            const uint32_t* _chunk_indices,
+                            const float* queries,
+                            const uint32_t* index_list,
+                            float* query_kths,
+                            const filtering::base_filter& sample_filter,
+                            LutT* lut_scores,
+                            OutT* _out_scores,
+                            uint32_t* _out_indices);
+
+/**
+ * Use heuristics to choose an optimal instance of the search kernel.
+ * It selects among a few kernel variants (with/out using shared mem for
+ * lookup tables / precomputed distances) and tries to choose the block size
+ * to maximize kernel occupancy.
+ *
+ * @param manage_local_topk
+ *    whether use the fused calculate+select or just calculate the distances for each
+ *    query and probed cluster.
+ *
+ * @param locality_hint
+ *    beyond this limit do not consider increasing the number of active blocks per SM
+ *    would improve locality anymore.
+ */
+template <typename OutT, typename LutT>
+auto compute_similarity_select(const cudaDeviceProp& dev_props,
+                               bool manage_local_topk,
+                               int locality_hint,
+                               double preferred_shmem_carveout,
+                               uint32_t pq_bits,
+                               uint32_t pq_dim,
+                               uint32_t precomp_data_count,
+                               uint32_t n_queries,
+                               uint32_t n_probes,
+                               uint32_t topk) -> selected<OutT, LutT>;
+
+}  // namespace cuvs::neighbors::ivf_pq::detail
+
+#define instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(OutT, LutT)         \
+  extern template auto cuvs::neighbors::ivf_pq::detail::compute_similarity_select<OutT, LutT>( \
+    const cudaDeviceProp& dev_props,                                                           \
+    bool manage_local_topk,                                                                    \
+    int locality_hint,                                                                         \
+    double preferred_shmem_carveout,                                                           \
+    uint32_t pq_bits,                                                                          \
+    uint32_t pq_dim,                                                                           \
+    uint32_t precomp_data_count,                                                               \
+    uint32_t n_queries,                                                                        \
+    uint32_t n_probes,                                                                         \
+    uint32_t topk) -> cuvs::neighbors::ivf_pq::detail::selected<OutT, LutT>;                   \
+                                                                                               \
+  extern template void cuvs::neighbors::ivf_pq::detail::compute_similarity_run<OutT, LutT>(    \
+    cuvs::neighbors::ivf_pq::detail::selected<OutT, LutT> s,                                   \
+    rmm::cuda_stream_view stream,                                                              \
+    uint32_t dim,                                                                              \
+    uint32_t n_probes,                                                                         \
+    uint32_t pq_dim,                                                                           \
+    uint32_t n_queries,                                                                        \
+    uint32_t queries_offset,                                                                   \
+    cuvs::distance::DistanceType metric,                                                       \
+    cuvs::neighbors::ivf_pq::codebook_gen codebook_kind,                                       \
+    uint32_t topk,                                                                             \
+    uint32_t max_samples,                                                                      \
+    const float* cluster_centers,                                                              \
+    const float* pq_centers,                                                                   \
+    const uint8_t* const* pq_dataset,                                                          \
+    const uint32_t* cluster_labels,                                                            \
+    const uint32_t* _chunk_indices,                                                            \
+    const float* queries,                                                                      \
+    const uint32_t* index_list,                                                                \
+    float* query_kths,                                                                         \
+    const filtering::base_filter& sample_filter,                                               \
+    LutT* lut_scores,                                                                          \
+    OutT* _out_scores,                                                                         \
+    uint32_t* _out_indices);
+
+#define COMMA ,
+instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(
+  half, cuvs::neighbors::ivf_pq::detail::fp_8bit<5u COMMA false>);
+instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(
+  half, cuvs::neighbors::ivf_pq::detail::fp_8bit<5u COMMA true>);
+instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(half, half);
+instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(float, half);
+instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(float, float);
+instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(
+  float, cuvs::neighbors::ivf_pq::detail::fp_8bit<5u COMMA false>);
+instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select(
+  float, cuvs::neighbors::ivf_pq::detail::fp_8bit<5u COMMA true>);
+
+#undef COMMA
+
+#undef instantiate_cuvs_neighbors_ivf_pq_detail_compute_similarity_select
