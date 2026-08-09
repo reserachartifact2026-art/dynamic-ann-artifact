@@ -22,6 +22,12 @@ typedef struct _InsertParams
     bool persist_graph = false;
 } InsertParams;
 
+enum class FreshBANGMode {
+    kLegacy = 0,
+    kBuild,
+    kLoad
+};
+
 template<typename T>
 class FreshBANG
 {
@@ -41,7 +47,7 @@ public:
     // called only ONCE in the beginning, not before every build/createAlgo
     bool SetDatasetParams(BuildParams params);
 
-    bool CreateAlgo(const std::string& conf_path);
+    bool CreateAlgo(const std::string& conf_path, FreshBANGMode mode = FreshBANGMode::kLegacy);
 
     bool BuildIndex(const T* base_vectors, uint32_t num_base_vectors);
 
@@ -83,5 +89,5 @@ public:
 // --- explicit instantiation ---
 template class FreshBANG<float>;
 // More data types can be instantiated as needed
-//template class FreshBANG<uint8_t>;
+template class FreshBANG<uint8_t>;
 //template class FreshBANG<int8_t>;

@@ -22,6 +22,29 @@ namespace {
 enum class dataset_dtype { kFloat32, kInt32, kUInt8, kInt8, kUnknown };
 enum class pipeline_op_type { kInsert, kDelete };
 
+auto mode_to_string(FreshBANGMode mode) -> const char*
+{
+  switch (mode) {
+    case FreshBANGMode::kLegacy: return "legacy";
+    case FreshBANGMode::kBuild: return "build";
+    case FreshBANGMode::kLoad: return "load";
+  }
+  return "unknown";
+}
+
+auto parse_mode_flag(const std::string& flag, FreshBANGMode& mode) -> bool
+{
+  if (flag == "--build") {
+    mode = FreshBANGMode::kBuild;
+    return true;
+  }
+  if (flag == "--load") {
+    mode = FreshBANGMode::kLoad;
+    return true;
+  }
+  return false;
+}
+
 struct pipeline_op {
   pipeline_op_type type;
   uint64_t first_id;
@@ -189,8 +212,9 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
                   const std::string& conf_path,
                   const std::string& data_prefix,
                   const std::string& index_prefix,
-                  uint32_t recall_at_k,
-                  const std::vector<pipeline_op>& pipeline_ops) -> int
+                  std::optional<uint32_t> recall_at_k,
+                  const std::vector<pipeline_op>& pipeline_ops,
+                  FreshBANGMode mode) -> int
 {
   cuvs::bench::blob<T> base_blob(
     dataset_conf.base_file, dataset_conf.subset_first_row, dataset_conf.subset_size);
@@ -211,8 +235,9 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
     return 1;
   }
 
-  std::cout << "[freshbang_driver] CreateAlgo(conf_path=" << conf_path << ")" << std::endl;
-  if (!freshbang.CreateAlgo(conf_path)) {
+  std::cout << "[freshbang_driver] CreateAlgo(conf_path=" << conf_path
+            << ", mode=" << mode_to_string(mode) << ")" << std::endl;
+  if (!freshbang.CreateAlgo(conf_path, mode)) {
     std::cerr << "[freshbang_driver] CreateAlgo failed" << std::endl;
     return 1;
   }
@@ -227,6 +252,16 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
   freshbang.SaveIndex();
   std::cout << "[freshbang_driver] Build pipeline completed successfully" << std::endl;
 
+  if (mode == FreshBANGMode::kBuild) {
+    std::cout << "[freshbang_driver] Build mode: skipping search/insert/delete phases" << std::endl;
+    return 0;
+  }
+
+  if (!recall_at_k.has_value()) {
+    std::cerr << "[freshbang_driver] recall_at_k is required outside build mode" << std::endl;
+    return 1;
+  }
+
   std::ifstream conf_stream(conf_path);
   cuvs::bench::ensure_stream_open(conf_stream, conf_path);
   auto& conf = cuvs::bench::configuration::initialize(conf_stream, data_prefix, index_prefix);
@@ -239,7 +274,7 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
     std::min<uint32_t>(static_cast<uint32_t>(dataset->query_set_size()), 10000U);
 
   SearchParams search_params{};
-  search_params.recall_at_k = recall_at_k;
+  search_params.recall_at_k = *recall_at_k;
 
   const auto result_count = static_cast<std::size_t>(batch_size) * search_params.recall_at_k;
   std::vector<uint64_t> ids(result_count, 0ULL);
@@ -485,7 +520,7 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
   std::fill(neighbors.begin(), neighbors.end(), 0U);
   std::fill(distances.begin(), distances.end(), 0.0F);
   // Run search 3 times after all configured insert/delete operations complete.
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < 0; ++i) {
     run_search_phase((std::string("BatchedSearch final") + std::to_string(i + 1)).c_str());
   }
   if (!dump_ids_to_file(batch_size)) {
@@ -502,8 +537,9 @@ auto run_workload(const cuvs::bench::configuration::dataset_conf& dataset_conf,
 
 int main(int argc, char** argv)
 {
-  if (argc != 3) {
-    std::cerr << "Usage: " << argv[0] << " <conf_path> <recall_at_k>" << std::endl;
+  if (argc != 3 && argc != 4) {
+    std::cerr << "Usage: " << argv[0] << " <conf_path> <recall_at_k> [--load]"
+              << std::endl;
     std::cerr << "\nDefault phases: SetDatasetParams → CreateAlgo → BuildIndex"
                  " → SetSearchParams → BatchedSearch → SetInsertParams"
                  " → BatchedInsert → BatchedSearch"
@@ -511,6 +547,9 @@ int main(int argc, char** argv)
     std::cerr << "\nRequired Parameters:" << std::endl;
     std::cerr << "  conf_path       - Path to JSON configuration file" << std::endl;
     std::cerr << "  recall_at_k     - Search K to pass into SetSearchParams" << std::endl;
+    std::cerr << "\nOptional Mode Flags:" << std::endl;
+    std::cerr << "  --build         - Build-only mode; creates/overwrites index" << std::endl;
+    std::cerr << "  --load          - Load-only mode; treats index as read-only" << std::endl;
     std::cerr << "\nConfiguration:" << std::endl;
     std::cerr << "  Data and index prefixes are read from 'freshbang.cfg' in the current "
                  "directory." << std::endl;
@@ -539,18 +578,55 @@ int main(int argc, char** argv)
   }
 
   const std::string conf_path = argv[1];
+  FreshBANGMode mode           = FreshBANGMode::kLegacy;
+  std::optional<uint32_t> recall_at_k;
 
-  uint32_t recall_at_k = 0;
+  if (argc == 3) {
+    const std::string arg2 = argv[2];
+    if (arg2 == "--build") {
+      mode = FreshBANGMode::kBuild;
+    } else if (arg2 == "--load") {
+      std::cerr << "[freshbang_driver] --load requires recall_at_k. Use: " << argv[0]
+                << " <conf_path> <recall_at_k> --load" << std::endl;
+      return 2;
+    } else {
+      try {
+        auto parsed_recall = static_cast<uint32_t>(std::stoul(arg2));
+        if (parsed_recall == 0) {
+          std::cerr << "[freshbang_driver] recall_at_k must be greater than zero." << std::endl;
+          return 2;
+        }
+        recall_at_k = parsed_recall;
+      } catch (const std::exception&) {
+        std::cerr << "[freshbang_driver] Invalid argument: '" << arg2
+                  << "'. Expected recall_at_k or --build." << std::endl;
+        return 2;
+      }
+    }
+  } else if (argc == 4) {
+    try {
+      auto parsed_recall = static_cast<uint32_t>(std::stoul(argv[2]));
+      if (parsed_recall == 0) {
+        std::cerr << "[freshbang_driver] recall_at_k must be greater than zero." << std::endl;
+        return 2;
+      }
+      recall_at_k = parsed_recall;
+    } catch (const std::exception&) {
+      std::cerr << "[freshbang_driver] Invalid recall_at_k: '" << argv[2]
+                << "'. It must be a positive integer." << std::endl;
+      return 2;
+    }
 
-  try {
-    recall_at_k = static_cast<uint32_t>(std::stoul(argv[2]));
-  } catch (const std::exception&) {
-    std::cerr << "[freshbang_driver] Invalid recall_at_k: '" << argv[2]
-              << "'. It must be a positive integer." << std::endl;
-    return 2;
+    const std::string mode_flag = argv[3];
+    if (!parse_mode_flag(mode_flag, mode)) {
+      std::cerr << "[freshbang_driver] Invalid mode flag: '" << mode_flag
+                << "'. Supported flags are --build and --load." << std::endl;
+      return 2;
+    }
   }
-  if (recall_at_k == 0) {
-    std::cerr << "[freshbang_driver] recall_at_k must be greater than zero." << std::endl;
+
+  if (mode == FreshBANGMode::kLoad && !recall_at_k.has_value()) {
+    std::cerr << "[freshbang_driver] recall_at_k is required for load mode." << std::endl;
     return 2;
   }
 
@@ -574,7 +650,10 @@ int main(int argc, char** argv)
             << "  conf_path=" << conf_path << std::endl
             << "  data_prefix=" << data_prefix << std::endl
             << "  index_prefix=" << index_prefix << std::endl
-            << "  recall_at_k=" << recall_at_k << std::endl
+            << "  recall_at_k=" << (recall_at_k.has_value() ? std::to_string(*recall_at_k)
+                                                            : std::string("<unset>"))
+            << std::endl
+            << "  mode=" << mode_to_string(mode) << std::endl
             << "  operations=" << driver_config.operations.size() << std::endl;
 
   try {
@@ -595,7 +674,7 @@ int main(int argc, char** argv)
       return 1;
     }
 
-    // Current library instantiation guarantees float support.
+    // Current library instantiation guarantees float and uint8 support.
     if (dtype == dataset_dtype::kFloat32) {
       return run_workload<float>(
         dataset_conf,
@@ -603,17 +682,23 @@ int main(int argc, char** argv)
         data_prefix_norm,
         index_prefix_norm,
         recall_at_k,
-        driver_config.operations);
+        driver_config.operations,
+        mode);
+    }
+
+    if (dtype == dataset_dtype::kUInt8) {
+      return run_workload<uint8_t>(
+        dataset_conf,
+        conf_path,
+        data_prefix_norm,
+        index_prefix_norm,
+        recall_at_k,
+        driver_config.operations,
+        mode);
     }
 
     if (dtype == dataset_dtype::kInt32) {
       std::cerr << "[freshbang_driver] base_file indicates int32 (.ibin), but FreshBANG<int32> "
-                   "is not instantiated in the current library."
-                << std::endl;
-      return 1;
-    }
-    if (dtype == dataset_dtype::kUInt8) {
-      std::cerr << "[freshbang_driver] base_file indicates uint8 (.u8bin), but FreshBANG<uint8_t> "
                    "is not instantiated in the current library."
                 << std::endl;
       return 1;

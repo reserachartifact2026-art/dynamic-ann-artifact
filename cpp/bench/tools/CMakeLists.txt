@@ -7,6 +7,9 @@ add_executable(connected_components_scc connected_components_scc.cpp)
 add_executable(test_knn_quality test_knn_quality.cpp)
 add_executable(discover_cagra_graph discover_cagra_graph.cpp)
 add_executable(bfs_level_counts bfs_level_counts.cpp)
+add_executable(cluster_incoming_quality cluster_incoming_quality.cpp)
+
+
 
 # Try to find RAFT and RMM
 find_package(raft REQUIRED CONFIG)
@@ -68,6 +71,13 @@ target_link_libraries(bfs_level_counts
         OpenMP::OpenMP_CXX
 )
 
+target_link_libraries(cluster_incoming_quality
+    PRIVATE
+        raft::raft
+        rmm::rmm
+        CUDA::cudart
+        OpenMP::OpenMP_CXX
+)
 # Add to the meta target "tools" defined in cpp/CMakeLists.txt
 add_dependencies(tools print_cagra_graph)
 add_dependencies(tools gen_cagra_graph)
@@ -76,4 +86,5 @@ add_dependencies(tools connected_components_scc)
 add_dependencies(tools test_knn_quality)
 add_dependencies(tools discover_cagra_graph)
 add_dependencies(tools bfs_level_counts)
+add_dependencies(tools cluster_incoming_quality)
 

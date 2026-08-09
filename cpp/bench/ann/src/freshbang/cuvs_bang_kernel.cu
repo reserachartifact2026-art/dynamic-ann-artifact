@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <raft/util/cudart_utils.hpp>
+#include <cub/cub.cuh>
 
 #include <cstdio>
 #include <cstdint>
@@ -24,6 +25,7 @@ namespace cuvs::bench::detail {
     uint8_t* deleted_rows;
     uint32_t* reverse_graph;
     int64_t reverse_graph_cols;
+    uint32_t* reverse_row_ptr;
     uint32_t* reverse_counts;
   } DeleteKernelParams;
 
@@ -57,14 +59,11 @@ __device__ __forceinline__ bool is_invalid_or_deleted_neighbor(const InsertKerne
   return params.deleted_rows[neighbor] == 1;
 }
 
-__global__ void cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
+__global__ void cuvs_bang_count_reverse_graph_kernel(const uint32_t* graph,
                                                      int64_t graph_rows,
                                                      int64_t graph_cols,
-                                                     uint32_t* reverse_graph,
-                                                     int64_t reverse_graph_cols,
                                                      const uint8_t* deleted_rows,
                                                      uint32_t* reverse_counts,
-                                                     uint32_t* dropped_edges_count,
                                                      uint32_t* skipped_invalid_dst_count,
                                                      uint32_t* skipped_deleted_src_count,
                                                      uint32_t* skipped_deleted_dst_count)
@@ -93,15 +92,244 @@ __global__ void cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
       }
 
       auto pos = atomicAdd(reverse_counts + dst, 1U);
-      if (static_cast<int64_t>(pos) >= reverse_graph_cols) {
-        atomicAdd(dropped_edges_count, 1U);
-        continue;
-      }
-
-      reverse_graph[static_cast<uint64_t>(dst) * static_cast<uint64_t>(reverse_graph_cols) + pos] =
-        static_cast<uint32_t>(src_row);
+      (void)pos;
     }
   }
+}
+
+__global__ void cuvs_bang_fill_reverse_graph_kernel(const uint32_t* graph,
+                                                    int64_t graph_rows,
+                                                    int64_t graph_cols,
+                                                    const uint8_t* deleted_rows,
+                                                    uint32_t* reverse_graph,
+                                                    uint32_t* reverse_write_offsets)
+{
+  auto col_idx = static_cast<int64_t>(threadIdx.x);
+  auto row_idx = static_cast<int64_t>(blockIdx.x);
+
+  for (int64_t src_row = row_idx; src_row < graph_rows; src_row += static_cast<int64_t>(gridDim.x)) {
+    if (deleted_rows && deleted_rows[src_row] == 1) { continue; }
+
+    for (int64_t col = col_idx; col < graph_cols; col += static_cast<int64_t>(blockDim.x)) {
+      auto off = static_cast<uint64_t>(src_row) * static_cast<uint64_t>(graph_cols) +
+                 static_cast<uint64_t>(col);
+      auto dst = graph[off];
+      if (static_cast<int64_t>(dst) >= graph_rows) { continue; }
+      if (deleted_rows && deleted_rows[dst] == 1) { continue; }
+
+      auto pos = atomicAdd(reverse_write_offsets + dst, 1U);
+      reverse_graph[pos] = static_cast<uint32_t>(src_row);
+    }
+  }
+}
+
+__global__ void cuvs_bang_verify_no_deleted_neighbors_kernel(const uint32_t* graph,
+                                                             int64_t graph_rows,
+                                                             int64_t graph_cols,
+                                                             const uint8_t* deleted_rows,
+                                                             uint64_t* deleted_edge_count,
+                                                             uint64_t* sample_src,
+                                                             uint64_t* sample_dst,
+                                                             uint32_t max_samples)
+{
+  auto col_idx = static_cast<int64_t>(threadIdx.x);
+  auto row_idx = static_cast<int64_t>(blockIdx.x);
+
+  for (int64_t src_row = row_idx; src_row < graph_rows; src_row += static_cast<int64_t>(gridDim.x)) {
+    if (deleted_rows && deleted_rows[src_row] == 1) { continue; }
+
+    for (int64_t col = col_idx; col < graph_cols; col += static_cast<int64_t>(blockDim.x)) {
+      auto off = static_cast<uint64_t>(src_row) * static_cast<uint64_t>(graph_cols) +
+                 static_cast<uint64_t>(col);
+      auto dst = graph[off];
+      if (static_cast<int64_t>(dst) >= graph_rows) { continue; }
+      if (!(deleted_rows && deleted_rows[dst] == 1)) { continue; }
+
+      auto hit_idx = static_cast<uint64_t>(atomicAdd(
+        reinterpret_cast<unsigned long long*>(deleted_edge_count),
+        static_cast<unsigned long long>(1)));
+      if (hit_idx < static_cast<uint64_t>(max_samples)) {
+        sample_src[hit_idx] = static_cast<uint64_t>(src_row);
+        sample_dst[hit_idx] = static_cast<uint64_t>(dst);
+      }
+    }
+  }
+}
+
+__global__ void cuvs_bang_sanitize_deleted_neighbors_kernel(uint32_t* graph,
+                                                            int64_t graph_rows,
+                                                            int64_t graph_cols,
+                                                            const uint8_t* deleted_rows,
+                                                            uint64_t* replaced_edge_count,
+                                                            uint64_t* no_fallback_row_count)
+{
+  auto row_idx = static_cast<int64_t>(blockIdx.x);
+  auto col_idx = static_cast<int64_t>(threadIdx.x);
+  if (row_idx >= graph_rows || col_idx >= graph_cols) { return; }
+  if (deleted_rows && deleted_rows[row_idx] == 1) { return; }
+
+  __shared__ uint32_t s_fallback_neighbor;
+  if (col_idx == 0) {
+    s_fallback_neighbor = UINT32_MAX;
+    for (int64_t c = 0; c < graph_cols; ++c) {
+      auto nb = graph[static_cast<uint64_t>(row_idx) * static_cast<uint64_t>(graph_cols) +
+                      static_cast<uint64_t>(c)];
+      if (static_cast<int64_t>(nb) < graph_rows && (!deleted_rows || deleted_rows[nb] != 1)) {
+        s_fallback_neighbor = nb;
+        break;
+      }
+    }
+    if (s_fallback_neighbor == UINT32_MAX) {
+      atomicAdd(reinterpret_cast<unsigned long long*>(no_fallback_row_count),
+                static_cast<unsigned long long>(1));
+    }
+  }
+  __syncthreads();
+
+  auto off = static_cast<uint64_t>(row_idx) * static_cast<uint64_t>(graph_cols) +
+             static_cast<uint64_t>(col_idx);
+  auto dst = graph[off];
+  if (static_cast<int64_t>(dst) >= graph_rows) { return; }
+  if (!(deleted_rows && deleted_rows[dst] == 1)) { return; }
+  if (s_fallback_neighbor == UINT32_MAX) { return; }
+
+  graph[off] = s_fallback_neighbor;
+  atomicAdd(reinterpret_cast<unsigned long long*>(replaced_edge_count),
+            static_cast<unsigned long long>(1));
+}
+
+void cuvs_bang_sanitize_deleted_neighbors(uint32_t* graph,
+                                          int64_t graph_rows,
+                                          int64_t graph_cols,
+                                          const uint8_t* deleted_rows)
+{
+  if (!graph || !deleted_rows || graph_rows <= 0 || graph_cols <= 0) { return; }
+
+  uint64_t* d_replaced_edge_count = nullptr;
+  uint64_t* d_no_fallback_row_count = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_replaced_edge_count), sizeof(uint64_t)));
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_no_fallback_row_count), sizeof(uint64_t)));
+  RAFT_CUDA_TRY(cudaMemset(d_replaced_edge_count, 0, sizeof(uint64_t)));
+  RAFT_CUDA_TRY(cudaMemset(d_no_fallback_row_count, 0, sizeof(uint64_t)));
+
+  uint32_t threads = static_cast<uint32_t>(graph_cols > 1024 ? 1024 : graph_cols);
+  if (threads == 0) {
+    RAFT_CUDA_TRY(cudaFree(d_replaced_edge_count));
+    RAFT_CUDA_TRY(cudaFree(d_no_fallback_row_count));
+    return;
+  }
+
+  auto blocks = static_cast<uint32_t>(graph_rows);
+  cuvs_bang_sanitize_deleted_neighbors_kernel<<<blocks, threads>>>(graph,
+                                                                    graph_rows,
+                                                                    graph_cols,
+                                                                    deleted_rows,
+                                                                    d_replaced_edge_count,
+                                                                    d_no_fallback_row_count);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+
+  uint64_t h_replaced_edge_count = 0;
+  uint64_t h_no_fallback_row_count = 0;
+  RAFT_CUDA_TRY(cudaMemcpy(&h_replaced_edge_count,
+                           d_replaced_edge_count,
+                           sizeof(uint64_t),
+                           cudaMemcpyDeviceToHost));
+  RAFT_CUDA_TRY(cudaMemcpy(&h_no_fallback_row_count,
+                           d_no_fallback_row_count,
+                           sizeof(uint64_t),
+                           cudaMemcpyDeviceToHost));
+
+  if (h_replaced_edge_count > 0 || h_no_fallback_row_count > 0) {
+    std::printf("[bang][sanitize_delete] replaced_deleted_edges=%llu rows_without_fallback=%llu\n",
+                static_cast<unsigned long long>(h_replaced_edge_count),
+                static_cast<unsigned long long>(h_no_fallback_row_count));
+  }
+
+  RAFT_CUDA_TRY(cudaFree(d_replaced_edge_count));
+  RAFT_CUDA_TRY(cudaFree(d_no_fallback_row_count));
+}
+
+void cuvs_bang_verify_no_deleted_neighbors(const uint32_t* graph,
+                                           int64_t graph_rows,
+                                           int64_t graph_cols,
+                                           const uint8_t* deleted_rows)
+{
+  if (!graph || !deleted_rows || graph_rows <= 0 || graph_cols <= 0) { return; }
+
+  constexpr uint32_t kMaxSamples = 32;
+  uint64_t* d_deleted_edge_count = nullptr;
+  uint64_t* d_sample_src         = nullptr;
+  uint64_t* d_sample_dst         = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_deleted_edge_count), sizeof(uint64_t)));
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_sample_src), kMaxSamples * sizeof(uint64_t)));
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_sample_dst), kMaxSamples * sizeof(uint64_t)));
+  RAFT_CUDA_TRY(cudaMemset(d_deleted_edge_count, 0, sizeof(uint64_t)));
+
+  uint32_t threads = static_cast<uint32_t>(graph_cols > 1024 ? 1024 : graph_cols);
+  if (threads == 0) {
+    RAFT_CUDA_TRY(cudaFree(d_deleted_edge_count));
+    RAFT_CUDA_TRY(cudaFree(d_sample_src));
+    RAFT_CUDA_TRY(cudaFree(d_sample_dst));
+    return;
+  }
+  constexpr uint32_t kMaxBlocks = 10000;
+  auto blocks = static_cast<uint32_t>(graph_rows < static_cast<int64_t>(kMaxBlocks)
+                                        ? graph_rows
+                                        : static_cast<int64_t>(kMaxBlocks));
+  if (blocks == 0) {
+    RAFT_CUDA_TRY(cudaFree(d_deleted_edge_count));
+    RAFT_CUDA_TRY(cudaFree(d_sample_src));
+    RAFT_CUDA_TRY(cudaFree(d_sample_dst));
+    return;
+  }
+
+  cuvs_bang_verify_no_deleted_neighbors_kernel<<<blocks, threads>>>(graph,
+                                                                     graph_rows,
+                                                                     graph_cols,
+                                                                     deleted_rows,
+                                                                     d_deleted_edge_count,
+                                                                     d_sample_src,
+                                                                     d_sample_dst,
+                                                                     kMaxSamples);
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+
+  uint64_t h_deleted_edge_count = 0;
+  RAFT_CUDA_TRY(cudaMemcpy(&h_deleted_edge_count,
+                           d_deleted_edge_count,
+                           sizeof(uint64_t),
+                           cudaMemcpyDeviceToHost));
+  if (h_deleted_edge_count > 0) {
+    auto sample_count = static_cast<uint32_t>(h_deleted_edge_count < kMaxSamples
+                                                 ? h_deleted_edge_count
+                                                 : kMaxSamples);
+    std::vector<uint64_t> h_sample_src(sample_count);
+    std::vector<uint64_t> h_sample_dst(sample_count);
+    RAFT_CUDA_TRY(cudaMemcpy(h_sample_src.data(),
+                             d_sample_src,
+                             static_cast<size_t>(sample_count) * sizeof(uint64_t),
+                             cudaMemcpyDeviceToHost));
+    RAFT_CUDA_TRY(cudaMemcpy(h_sample_dst.data(),
+                             d_sample_dst,
+                             static_cast<size_t>(sample_count) * sizeof(uint64_t),
+                             cudaMemcpyDeviceToHost));
+    std::printf("[bang][verify_delete] ERROR: live rows still have deleted neighbors; total=%llu (showing %u)\n",
+                static_cast<unsigned long long>(h_deleted_edge_count),
+                sample_count);
+    for (uint32_t i = 0; i < sample_count; ++i) {
+      std::printf("[bang][verify_delete] sample %u: %llu -> %llu\n",
+                  i,
+                  static_cast<unsigned long long>(h_sample_src[i]),
+                  static_cast<unsigned long long>(h_sample_dst[i]));
+    }
+  } else {
+    std::printf("[bang][verify_delete] OK: no deleted neighbors found in live rows\n");
+  }
+
+  RAFT_CUDA_TRY(cudaFree(d_deleted_edge_count));
+  RAFT_CUDA_TRY(cudaFree(d_sample_src));
+  RAFT_CUDA_TRY(cudaFree(d_sample_dst));
 }
 
 template<typename T>
@@ -192,24 +420,15 @@ if (threadIdx.x == 0 && blockIdx.x == 0) {
   // returned by the search kernel.
   // - col_idx < recall_at_k : use the actual search result; pad with fallback if invalid/deleted.
   // - col_idx >= recall_at_k: no search result exists (OOB); pad with fallback to keep graph regular.
-  // Reverse graph is only updated for real valid neighbors, not padding writes, to avoid
-  // inflating the indegree of the fallback node.
+  // Reverse graph is rebuilt globally before delete, so we avoid incremental reverse updates here.
   if (static_cast<int64_t>(col_idx) < static_cast<int64_t>(recall_at_k)) {
     auto nbr_val = d_search_neighbors[(row_idx * recall_at_k) + col_idx];
     if (nbr_val >= 0 && nbr_val < params.graph_rows && params.deleted_rows[nbr_val] != 1) {
-      // Valid neighbor — write and update the reverse graph.
+      // Valid neighbor — write into forward graph.
       params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] =
         static_cast<uint32_t>(nbr_val);
-      auto pos = atomicAdd(params.reverse_counts + static_cast<uint32_t>(nbr_val), 1U);
-      if (static_cast<int64_t>(pos) >= params.reverse_graph_cols) {
-        printf("[bang_insert_kernel1] WARNING: reverse graph capacity exceeded for neighbor %u of inserted row %llu; some reverse edges may not be recorded.\n",
-               static_cast<uint32_t>(nbr_val), static_cast<unsigned long long>(cur_row));
-      } else {
-        params.reverse_graph[static_cast<uint64_t>(nbr_val) * static_cast<uint64_t>(params.reverse_graph_cols) + pos] =
-          static_cast<uint32_t>(cur_row);
-      }
     } else if (s_fallback_neighbor != UINT32_MAX) {
-      // Invalid or deleted result — pad with fallback; no reverse graph update.
+      // Invalid or deleted result — pad with fallback.
       params.graph[(cur_row * static_cast<uint64_t>(params.graph_cols)) + col_idx] = s_fallback_neighbor;
     }
     else {
@@ -261,7 +480,7 @@ __global__ void cuvs_bang_insert_kernel2(InsertKernelParams params)
     // Do not update rows that are also being inserted in this launch.
     if (is_row_in_insert_batch(params, static_cast<uint64_t>(cur_row_cur_neighbor))) 
     {
-      // print warning
+            // print warning
       printf("[bang_insert_kernel2] WARNING: cur_row %llu has neighbor %u that is also being inserted; skipping reverse-edge update for this neighbor.\n",
              static_cast<unsigned long long>(cur_row), static_cast<unsigned int>(cur_row_cur_neighbor)); 
       continue; 
@@ -286,43 +505,7 @@ __global__ void cuvs_bang_insert_kernel2(InsertKernelParams params)
             auto previous_neighbor = atomicExch(target_ptr, static_cast<uint32_t>(cur_row));
             if (previous_neighbor != static_cast<uint32_t>(cur_row)) {
               reverse_edge_added = true;
-
-              // Remove the old reverse link for the overwritten forward edge, if any.
-              if (static_cast<int64_t>(previous_neighbor) < params.graph_rows &&
-                  params.deleted_rows[previous_neighbor] != 1) {
-                int64_t prev_count = min(static_cast<int64_t>(params.reverse_counts[previous_neighbor]),
-                                         params.reverse_graph_cols);
-                for (int64_t c4 = 0; c4 < prev_count; ++c4) {
-                  auto off4 = previous_neighbor * static_cast<uint64_t>(params.reverse_graph_cols) + c4;
-                  if (params.reverse_graph[off4] == cur_row_cur_neighbor) {
-                    params.reverse_graph[off4] = UINT32_MAX;
-                    break;
-                  }
-                }
-              }
-
-              // cur_row_cur_neighbor now has a forward edge to cur_row, so cur_row_cur_neighbor
-              // is a new in-neighbor of cur_row — record it in the reverse graph.
-              auto pos = atomicAdd(params.reverse_counts + static_cast<uint32_t>(cur_row), 1U);
-              if (static_cast<int64_t>(pos) >= params.reverse_graph_cols) {
-                printf("[bang_insert_kernel2] WARNING: reverse graph capacity exceeded for cur_row %llu; some reverse edges may not be recorded.\n",
-                       static_cast<unsigned long long>(cur_row));
-                continue;
-              } else {
-                params.reverse_graph[static_cast<uint64_t>(cur_row) * static_cast<uint64_t>(params.reverse_graph_cols) + pos] =
-                  static_cast<uint32_t>(cur_row_cur_neighbor); // cur_row_cur_neighbor -> cur_row edge was just added
-              }
             }
-
-          // remove cur_row_cur_neighbor from IN Nodes of neighbor_of_cur_row_cur_neighbor
-          for (int64_t c3 = 0; c3 < params.reverse_counts[neighbor_of_cur_row_cur_neighbor]; c3++) {
-            auto off3 = neighbor_of_cur_row_cur_neighbor * static_cast<uint64_t>(params.reverse_graph_cols) + c3;
-            if (params.reverse_graph[off3] == cur_row_cur_neighbor) {
-              // Set it with sentinel value (UINT32_MAX) to indicate that this edge has been removed. This is a common practice to avoid shifting elements in an array.   
-              params.reverse_graph[off3] = UINT32_MAX;
-                      break;
-            }
-          }
 
           break;
           }
@@ -469,18 +652,18 @@ __global__ void cuvs_bang_delete_kernel2_reversegraph(DeleteKernelParams params)
   if (cur_row >= static_cast<uint64_t>(params.graph_rows)) { return; }
 
   if (params.deleted_rows[cur_row] != 1) { return; } // skip if not marked deleted
+  if (!params.reverse_row_ptr) { return; }
 
   // find a guaranteed non-deleted neighbour of cur_row to replace deleted-row references.
   // Only thread 0 scans the adjacency list; all others wait at __syncthreads().
   // Using uint32_t to match the graph element type; UINT32_MAX is the "not found" sentinel.
-  // s_in_count is saved here BEFORE zeroing reverse_counts so the loop can use the original count.
   __shared__ uint32_t backup_replacement_neighbor;
+  __shared__ uint32_t s_row_start;
   __shared__ int64_t  s_in_count;
   if (col_idx == 0) {
-    // Save the in-count BEFORE zeroing it — this is the critical fix.
-    // Cap at reverse_graph_cols because atomicAdd can push the count past the slot limit.
-    s_in_count = min(static_cast<int64_t>(params.reverse_counts[cur_row]),
-                     params.reverse_graph_cols);
+    s_row_start = params.reverse_row_ptr[cur_row];
+    auto row_end = params.reverse_row_ptr[cur_row + 1];
+    s_in_count = static_cast<int64_t>(row_end) - static_cast<int64_t>(s_row_start);
 
     backup_replacement_neighbor = UINT32_MAX; // sentinel: no valid backup found yet
     for (int64_t c = 0; c < params.graph_cols; c++) {
@@ -494,19 +677,13 @@ __global__ void cuvs_bang_delete_kernel2_reversegraph(DeleteKernelParams params)
       printf("[bang_kernel] WARNING: No non-deleted neighbor found for deleted row %llu\n",
              (unsigned long long)cur_row);
     }
-
-    // Reset the reverse count — the row is logically gone.
-    params.reverse_counts[cur_row] = 0;
   }
 
   __syncthreads();
 
-  
-  // scan the reverse graph to find the IN nodes of current cur_row.
-  // Use s_in_count (saved before zeroing) — reading params.reverse_counts[cur_row]
-  // here would return 0 since thread 0 already zeroed it above.
+  // Scan CSR reverse row [row_start, row_end) to find IN nodes of cur_row.
   for (int64_t col = col_idx; col < s_in_count; col += blockDim.x) {
-    uint32_t in_node = params.reverse_graph[cur_row * static_cast<uint64_t>(params.reverse_graph_cols) + col];
+    uint32_t in_node = params.reverse_graph[s_row_start + static_cast<uint32_t>(col)];
     if (static_cast<int64_t>(in_node) >= params.graph_rows || params.deleted_rows[in_node] == 1) { continue; } // skip invalid or deleted in_nodes
     // scan the adjacency list of in_node to find cur_row and replace it
     for (int64_t c = 0; c < params.graph_cols; ++c) {
@@ -543,40 +720,6 @@ __global__ void cuvs_bang_delete_kernel2_reversegraph(DeleteKernelParams params)
         if (replacement != UINT32_MAX) {
           // forward graph update
           params.graph[off] = replacement;
-          // Scan replacement's reverse list for cur_row and replace it with in_node.
-          // Cap the count: reverse_counts can overflow past reverse_graph_cols.
-          bool reverse_entry_updated = false;
-          int64_t repl_count = min(static_cast<int64_t>(params.reverse_counts[replacement]),
-                                   params.reverse_graph_cols);
-          for (int64_t c2 = 0; c2 < repl_count; c2++) {
-            auto off2 = replacement * static_cast<uint64_t>(params.reverse_graph_cols) + c2;
-            if (params.reverse_graph[off2] == cur_row)
-            {
-              if (in_node == 20284) {
-                printf("[bang_kernel] Replacing reverse graph entry for replacement %u and cur_row %llu with in_node %llu\n",
-                       replacement, (unsigned long long)cur_row, (unsigned long long)in_node);
-              }
-              params.reverse_graph[off2] = in_node;
-              reverse_entry_updated = true;
-              break;
-            }
-          }
-
-          // If cur_row was not present in replacement's reverse row (already compacted/overwritten),
-          // append a new reverse edge entry so reverse graph remains consistent with the forward edge.
-          if (!reverse_entry_updated) {
-            auto pos = atomicAdd(params.reverse_counts + replacement, 1U);
-            if (static_cast<int64_t>(pos) < params.reverse_graph_cols) {
-              params.reverse_graph[replacement * static_cast<uint64_t>(params.reverse_graph_cols) + pos] =
-                in_node;
-            } else {
-              /*
-              printf("[bang_kernel] WARNING: reverse graph capacity exceeded while appending replacement %u <- in_node %llu (cur_row %llu)\n",
-                     replacement,
-                     (unsigned long long)in_node,
-                     (unsigned long long)cur_row);*/
-            }
-          }
         }
         else
         {
@@ -704,32 +847,30 @@ void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
                                                  uint32_t* reverse_graph,
                                                  int64_t reverse_graph_cols,
                                                  const uint8_t* deleted_rows,
+                                                 uint32_t* reverse_row_ptr,
                                                  uint32_t* reverse_counts)
 {
-  if (!graph || !reverse_graph || !reverse_counts) { return; }
+  if (!graph || !reverse_graph || !reverse_row_ptr || !reverse_counts) { return; }
   if (graph_rows <= 0 || graph_cols <= 0 || reverse_graph_cols <= 0) { return; }
 
-  auto reverse_elems = static_cast<uint64_t>(graph_rows) * static_cast<uint64_t>(reverse_graph_cols);
-  RAFT_CUDA_TRY(cudaMemset(reverse_graph, 0, reverse_elems * sizeof(uint32_t)));
+  auto reverse_capacity = static_cast<uint64_t>(graph_rows) * static_cast<uint64_t>(reverse_graph_cols);
+  RAFT_CUDA_TRY(cudaMemset(reverse_graph, 0xFF, reverse_capacity * sizeof(uint32_t)));
 
-  uint32_t* d_dropped_edges  = nullptr;
   uint32_t* d_skipped_invalid_dst = nullptr;
   uint32_t* d_skipped_deleted_src = nullptr;
   uint32_t* d_skipped_deleted_dst = nullptr;
   RAFT_CUDA_TRY(cudaMemset(reverse_counts, 0, static_cast<size_t>(graph_rows) * sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMemset(reverse_row_ptr, 0, static_cast<size_t>(graph_rows + 1) * sizeof(uint32_t)));
 
-  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_dropped_edges), sizeof(uint32_t)));
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_skipped_invalid_dst), sizeof(uint32_t)));
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_skipped_deleted_src), sizeof(uint32_t)));
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_skipped_deleted_dst), sizeof(uint32_t)));
-  RAFT_CUDA_TRY(cudaMemset(d_dropped_edges, 0, sizeof(uint32_t)));
   RAFT_CUDA_TRY(cudaMemset(d_skipped_invalid_dst, 0, sizeof(uint32_t)));
   RAFT_CUDA_TRY(cudaMemset(d_skipped_deleted_src, 0, sizeof(uint32_t)));
   RAFT_CUDA_TRY(cudaMemset(d_skipped_deleted_dst, 0, sizeof(uint32_t)));
 
   uint32_t threads = static_cast<uint32_t>(graph_cols > 1024 ? 1024 : graph_cols);
   if (threads == 0) {
-    RAFT_CUDA_TRY(cudaFree(d_dropped_edges));
     RAFT_CUDA_TRY(cudaFree(d_skipped_invalid_dst));
     RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_src));
     RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_dst));
@@ -741,40 +882,119 @@ void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
                                         ? graph_rows
                                         : static_cast<int64_t>(kMaxBlocks));
   if (blocks == 0) {
-    RAFT_CUDA_TRY(cudaFree(d_dropped_edges));
     RAFT_CUDA_TRY(cudaFree(d_skipped_invalid_dst));
     RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_src));
     RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_dst));
     return;
   }
 
-  cuvs_bang_build_reverse_graph_kernel<<<blocks, threads>>>(graph,
-                                                             graph_rows,
-                                                             graph_cols,
-                                                             reverse_graph,
-                                                             reverse_graph_cols,
-                                                             deleted_rows,
-                                                             reverse_counts,
-                                                             d_dropped_edges,
-                                                             d_skipped_invalid_dst,
-                                                             d_skipped_deleted_src,
-                                                             d_skipped_deleted_dst);
+  cuvs_bang_count_reverse_graph_kernel<<<blocks, threads>>>(graph,
+                                                            graph_rows,
+                                                            graph_cols,
+                                                            deleted_rows,
+                                                            reverse_counts,
+                                                            d_skipped_invalid_dst,
+                                                            d_skipped_deleted_src,
+                                                            d_skipped_deleted_dst);
+
+  // Build canonical CSR row pointers:
+  //   row_ptr[0] = 0
+  //   row_ptr[i+1] = sum(counts[0..i])
+  // We use InclusiveSum into row_ptr+1 to directly produce the inclusive prefix.
+  void* d_scan_tmp = nullptr;
+  size_t scan_tmp_bytes = 0;
+  RAFT_CUDA_TRY(cub::DeviceScan::InclusiveSum(
+    d_scan_tmp, scan_tmp_bytes, reverse_counts, reverse_row_ptr + 1, static_cast<int>(graph_rows)));
+  RAFT_CUDA_TRY(cudaMalloc(&d_scan_tmp, scan_tmp_bytes));
+  RAFT_CUDA_TRY(cub::DeviceScan::InclusiveSum(
+    d_scan_tmp, scan_tmp_bytes, reverse_counts, reverse_row_ptr + 1, static_cast<int>(graph_rows)));
+  RAFT_CUDA_TRY(cudaFree(d_scan_tmp));
+
+ #if 0
+  // Debug: print total reverse edges from CSR tail pointer.
+  uint32_t h_total_reverse_edges = 0;
+  RAFT_CUDA_TRY(cudaMemcpy(&h_total_reverse_edges,
+                           reverse_row_ptr + graph_rows,
+                           sizeof(uint32_t),
+                           cudaMemcpyDeviceToHost));  
+  std::printf("[bang] total_reverse_edges=%u\n", h_total_reverse_edges);
+#endif
+  uint32_t* d_reverse_write_offsets = nullptr;
+  RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d_reverse_write_offsets),
+                           static_cast<size_t>(graph_rows) * sizeof(uint32_t)));
+  RAFT_CUDA_TRY(cudaMemcpy(d_reverse_write_offsets,
+                           reverse_row_ptr,
+                           static_cast<size_t>(graph_rows) * sizeof(uint32_t),
+                           cudaMemcpyDeviceToDevice));
+
+  cuvs_bang_fill_reverse_graph_kernel<<<blocks, threads>>>(graph,
+                                                           graph_rows,
+                                                           graph_cols,
+                                                           deleted_rows,
+                                                           reverse_graph,
+                                                           d_reverse_write_offsets);
+  RAFT_CUDA_TRY(cudaFree(d_reverse_write_offsets));
 
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
-
-  uint32_t h_dropped_edges = 0;
+#if 0
   uint32_t h_skipped_invalid_dst = 0;
   uint32_t h_skipped_deleted_src = 0;
   uint32_t h_skipped_deleted_dst = 0;
-  RAFT_CUDA_TRY(cudaMemcpy(
-    &h_dropped_edges, d_dropped_edges, sizeof(uint32_t), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(
     &h_skipped_invalid_dst, d_skipped_invalid_dst, sizeof(uint32_t), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(
     &h_skipped_deleted_src, d_skipped_deleted_src, sizeof(uint32_t), cudaMemcpyDeviceToHost));
   RAFT_CUDA_TRY(cudaMemcpy(
     &h_skipped_deleted_dst, d_skipped_deleted_dst, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+  // Debug consistency check:
+  // counted reverse edges must match total valid forward edges consumed by count kernel.
+  auto total_forward_slots = static_cast<uint64_t>(graph_rows) * static_cast<uint64_t>(graph_cols);
+  auto skipped_total       = static_cast<uint64_t>(h_skipped_deleted_src) +
+                       static_cast<uint64_t>(h_skipped_invalid_dst) +
+                       static_cast<uint64_t>(h_skipped_deleted_dst);
+  auto expected_reverse_edges = total_forward_slots >= skipped_total
+                                  ? (total_forward_slots - skipped_total)
+                                  : 0ULL;
+  if (expected_reverse_edges != static_cast<uint64_t>(h_total_reverse_edges)) {
+    std::printf(
+      "[bang][WARN] reverse edge mismatch: csr_total=%u expected_valid_forward_edges=%llu (rows=%lld cols=%lld skipped_deleted_src=%u skipped_invalid_dst=%u skipped_deleted_dst=%u)\n",
+      h_total_reverse_edges,
+      static_cast<unsigned long long>(expected_reverse_edges),
+      static_cast<long long>(graph_rows),
+      static_cast<long long>(graph_cols),
+      h_skipped_deleted_src,
+      h_skipped_invalid_dst,
+      h_skipped_deleted_dst);
+  }
+
+  // Consolidated post-build diagnostic: check reverse edge totals against
+  // allocated reverse-graph capacity (in edge slots).
+  auto reverse_capacity_edges = reverse_capacity;
+  if (static_cast<uint64_t>(h_total_reverse_edges) > reverse_capacity_edges) {
+    std::printf(
+      "[bang][WARN] reverse capacity overflow risk: csr_total=%u capacity_edges=%llu (rows=%lld rev_cols=%lld)\n",
+      h_total_reverse_edges,
+      static_cast<unsigned long long>(reverse_capacity_edges),
+      static_cast<long long>(graph_rows),
+      static_cast<long long>(reverse_graph_cols));
+  }
+  if (expected_reverse_edges > reverse_capacity_edges) {
+    std::printf(
+      "[bang][WARN] reverse capacity too small for expected edges: expected_valid_forward_edges=%llu capacity_edges=%llu (rows=%lld cols=%lld rev_cols=%lld)\n",
+      static_cast<unsigned long long>(expected_reverse_edges),
+      static_cast<unsigned long long>(reverse_capacity_edges),
+      static_cast<long long>(graph_rows),
+      static_cast<long long>(graph_cols),
+      static_cast<long long>(reverse_graph_cols));
+  }
+  std::printf(
+    "[bang][post_diag] reverse edges: csr_total=%u expected_valid_forward_edges=%llu capacity_edges=%llu\n",
+    h_total_reverse_edges,
+    static_cast<unsigned long long>(expected_reverse_edges),
+    static_cast<unsigned long long>(reverse_capacity_edges));
+
   if (h_skipped_invalid_dst > 0 || h_skipped_deleted_src > 0 || h_skipped_deleted_dst > 0) {
     std::printf(
       "[bang] reverse_graph build skipped invalid_dst=%u deleted_src=%u deleted_dst=%u (rows=%lld fwd_cols=%lld rev_cols=%lld)\n",
@@ -785,18 +1005,11 @@ void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
       static_cast<long long>(graph_cols),
       static_cast<long long>(reverse_graph_cols));
   }
-  if (h_dropped_edges > 0) {
-    std::printf("[bang] WARNING: reverse_graph build dropped=%u edges due to capacity (rows=%lld fwd_cols=%lld rev_cols=%lld)\n",
-                h_dropped_edges,
-                static_cast<long long>(graph_rows),
-                static_cast<long long>(graph_cols),
-                static_cast<long long>(reverse_graph_cols));
-  }
 
-  RAFT_CUDA_TRY(cudaFree(d_dropped_edges));
   RAFT_CUDA_TRY(cudaFree(d_skipped_invalid_dst));
   RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_src));
   RAFT_CUDA_TRY(cudaFree(d_skipped_deleted_dst));
+#endif
 }
 
 
@@ -808,6 +1021,7 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                     const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
                                     uint32_t* reverse_graph,
                                     int64_t reverse_graph_cols,
+                                    uint32_t* reverse_row_ptr,
                                     uint32_t* reverse_counts)
 {
   if (num_ids == 0) { return; }
@@ -817,6 +1031,7 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                             static_cast<uint8_t*>(d_deleted_rows->data()),
                             reverse_graph,
                             reverse_graph_cols,
+                            reverse_row_ptr,
                             reverse_counts};
 
   RAFT_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&params.row_num), num_ids * sizeof(uint64_t)));
@@ -831,6 +1046,7 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                               reverse_graph,
                                               reverse_graph_cols,
                                               static_cast<uint8_t*>(d_deleted_rows->data()),
+                                              reverse_row_ptr,
                                               reverse_counts);
 
   constexpr uint32_t threads = 1024;
@@ -845,8 +1061,21 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   RAFT_CUDA_TRY(cudaDeviceSynchronize());
+#if 0
+  // Global cleanup to prevent stale references to older deleted rows from
+  // accumulating across batched delete iterations.
+  cuvs_bang_sanitize_deleted_neighbors(mutable_graph_ptr,
+                                       graph_rows,
+                                       graph_cols,
+                                       static_cast<uint8_t*>(d_deleted_rows->data()));
 
-  std::printf("[bang] kernel processed=%zu ids\n", num_ids);
+  // Debug verifier: detect surviving edges from live rows to deleted destinations.
+  cuvs_bang_verify_no_deleted_neighbors(mutable_graph_ptr,
+                                        graph_rows,
+                                        graph_cols,
+                                        static_cast<uint8_t*>(d_deleted_rows->data()));
+#endif
+  std::printf("[bang] kernel processed=%zu ids (SKIPPED SANITIZE)\n", num_ids);
 
   RAFT_CUDA_TRY(cudaFree(params.row_num));
 }

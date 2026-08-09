@@ -21,6 +21,25 @@
 namespace cuvs::bench {
 namespace detail {
 
+inline auto is_device_pointer(const void* ptr) -> bool
+{
+  if (ptr == nullptr) { return false; }
+
+  cudaPointerAttributes attr{};
+  auto status = cudaPointerGetAttributes(&attr, ptr);
+  if (status != cudaSuccess) {
+    // Host pointers can fail this query on some CUDA/runtime combinations.
+    cudaGetLastError();
+    return false;
+  }
+
+#if CUDART_VERSION >= 10000
+  return attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged;
+#else
+  return attr.memoryType == cudaMemoryTypeDevice;
+#endif
+}
+
 struct algo_cache_entry {
   void* algo_ptr{nullptr};
   std::string algo_name;
@@ -51,6 +70,16 @@ struct FreshBANGConfig {
   std::string data_prefix{"data/"};
   std::string index_prefix{"index/"};
 };
+
+auto mode_to_string(FreshBANGMode mode) -> const char*
+{
+  switch (mode) {
+    case FreshBANGMode::kLegacy: return "legacy";
+    case FreshBANGMode::kBuild: return "build";
+    case FreshBANGMode::kLoad: return "load";
+  }
+  return "unknown";
+}
 
 auto read_freshbang_config(const std::string& config_path) -> FreshBANGConfig
 {
@@ -110,7 +139,8 @@ class AlgoCacheSingleton {
       return std::nullopt;
     }
 
-    auto elapsed = std::chrono::steady_clock::now() - entry.timestamp;
+    auto now     = std::chrono::steady_clock::now();
+    auto elapsed = now - entry.timestamp;
     if (std::chrono::duration_cast<std::chrono::minutes>(elapsed) >= max_age) {
       if (entry.algo_ptr != nullptr && entry.deleter) {
         entry.deleter(entry.algo_ptr);
@@ -119,6 +149,9 @@ class AlgoCacheSingleton {
       cache_.erase(it);
       return std::nullopt;
     }
+
+    // Sliding TTL: keep frequently-used algo entries alive during long stress runs.
+    entry.timestamp = now;
 
     return entry;
   }
@@ -212,6 +245,9 @@ class FreshBANGInner {
   }
   bool has_live_index() const { return has_live_index_; }
 
+  void set_mode(FreshBANGMode mode) { mode_ = mode; }
+  FreshBANGMode mode() const { return mode_; }
+
  private:
   std::string conf_path_;
   std::string data_prefix_;
@@ -223,6 +259,7 @@ class FreshBANGInner {
   cuvs::bench::algo_property algo_property_{};
   bool prefer_insert_dataset_for_search_{false};
   bool has_live_index_{false};
+  FreshBANGMode mode_{FreshBANGMode::kLegacy};
 };
 
 }  // namespace detail
@@ -268,11 +305,12 @@ bool FreshBANG<T>::SetDatasetParams(BuildParams params)
 }
 
 template <typename T>
-bool FreshBANG<T>::CreateAlgo(const std::string& conf_path)
+bool FreshBANG<T>::CreateAlgo(const std::string& conf_path, FreshBANGMode mode)
 {
   std::lock_guard<std::recursive_mutex> api_lock(cuvs::bench::get_bench_api_mutex());
 
-  std::cout << "[FreshBANG::CreateAlgo] called" << std::endl;
+  std::cout << "[FreshBANG::CreateAlgo] called mode=" << cuvs::bench::detail::mode_to_string(mode)
+            << std::endl;
   if (conf_path.empty()) {
     std::cerr << "[FreshBANG::CreateAlgo] Error: conf_path must be non-empty." << std::endl;
     return false;
@@ -301,6 +339,8 @@ bool FreshBANG<T>::CreateAlgo(const std::string& conf_path)
   }
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
   impl->set_conf_path(conf_path);
+  impl->set_mode(mode);
+  impl->set_has_live_index(false);
 
   std::cout << "[FreshBANG::CreateAlgo] Calling invoke_create_algo for algo='" << index.algo
             << "' distance='" << user_build_params_.distance_measure << "' rows="
@@ -322,6 +362,26 @@ bool FreshBANG<T>::CreateAlgo(const std::string& conf_path)
   }
 
   impl->set_index_info(index.file, index.algo, static_cast<int>(user_build_params_.dataset_dim));
+
+  if (mode == FreshBANGMode::kLoad) {
+    if (!cuvs::bench::detail::file_exists(index.file)) {
+      std::cerr << "[FreshBANG::CreateAlgo] Error: --load mode requires an existing index file at '"
+                << index.file << "'." << std::endl;
+      return false;
+    }
+
+    std::cout << "[FreshBANG::CreateAlgo] Load mode: loading index from disk: " << index.file
+              << std::endl;
+    try {
+      algo->load(index.file);
+      impl->set_has_live_index(true);
+      std::cout << "[FreshBANG::CreateAlgo] Load mode: load() completed" << std::endl;
+    } catch (const std::exception& e) {
+      std::cerr << "[FreshBANG::CreateAlgo] Error: failed to load index '" << index.file
+                << "': " << e.what() << std::endl;
+      return false;
+    }
+  }
 
   cuvs::bench::detail::algo_cache_entry cache_entry;
   cache_entry.algo_ptr   = algo.release();
@@ -372,17 +432,82 @@ bool FreshBANG<T>::BuildIndex(const T* base_vectors, uint32_t num_basevectors)
     return false;
   }
 
+  const auto index_path = std::filesystem::path(impl->index_file());
+  const auto mode = impl->mode();
+  const bool has_index_on_disk = cuvs::bench::detail::file_exists(impl->index_file());
+  std::cout << "[FreshBANG::BuildIndex] mode=" << cuvs::bench::detail::mode_to_string(mode)
+            << " index_file='" << impl->index_file() << "' has_index_on_disk=" << std::boolalpha
+            << has_index_on_disk << std::endl;
+
+  auto log_gpu_mem = [](const char* stage) {
+    size_t free_bytes  = 0;
+    size_t total_bytes = 0;
+    auto mem_status    = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (mem_status != cudaSuccess) {
+      std::cerr << "[FreshBANG::BuildIndex] " << stage
+                << " cudaMemGetInfo failed: " << cudaGetErrorString(mem_status) << std::endl;
+      return;
+    }
+    auto used_bytes = total_bytes - free_bytes;
+    constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+    std::cout << "[FreshBANG::BuildIndex] " << stage
+              << " used_GiB=" << (static_cast<double>(used_bytes) / gib)
+              << " free_GiB=" << (static_cast<double>(free_bytes) / gib)
+              << " total_GiB=" << (static_cast<double>(total_bytes) / gib) << std::endl;
+  };
+
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    std::cerr << "[FreshBANG::BuildIndex] Warning: cudaDeviceSynchronize failed before load/build."
+              << std::endl;
+  }
+  log_gpu_mem("before_load_or_build");
+
+  if (mode == FreshBANGMode::kLoad) {
+    if (!impl->has_live_index()) {
+      std::cerr << "[FreshBANG::BuildIndex] Error: load mode expects index to be loaded by "
+                   "CreateAlgo(), but no live index is available." << std::endl;
+      return false;
+    }
+    std::cout << "[FreshBANG::BuildIndex] Load mode: skipping build; index already loaded by "
+                 "CreateAlgo" << std::endl;
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+      std::cerr << "[FreshBANG::BuildIndex] Warning: cudaDeviceSynchronize failed in load mode."
+                << std::endl;
+    }
+    log_gpu_mem("after_load_from_create_algo");
+    return true;
+  }
+
+  if (mode == FreshBANGMode::kLegacy) {
+    std::cout << "[FreshBANG::BuildIndex] Legacy mode selected; always building fresh index"
+              << std::endl;
+  }
+
+  if (mode == FreshBANGMode::kBuild) {
+    std::cout << "[FreshBANG::BuildIndex] Build mode selected; forcing build and allowing overwrite"
+              << std::endl;
+  }
+
   std::cout << "[FreshBANG::BuildIndex] Calling set_build_output_file('" << impl->index_file() << "')"
             << std::endl;
   algo_obj->set_build_output_file(impl->index_file());
 
   std::cout << "[FreshBANG::BuildIndex] Calling build() with " << num_basevectors << " vectors..."
             << std::endl;
+
+  std::cout << "[FreshBANG::BuildIndex] Building new index" << std::endl;
+
   // Note: base_vector can be on host or device. CAGRA wrapper will handle copying if needed.
   algo_obj->build(base_vectors, num_basevectors);
+
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    std::cerr << "[FreshBANG::BuildIndex] Warning: cudaDeviceSynchronize failed after build."
+              << std::endl;
+  }
+  log_gpu_mem("after_build");
+
   std::cout << "[FreshBANG::BuildIndex] build() completed" << std::endl;
 
-  auto index_path = std::filesystem::path(impl->index_file());
   if (index_path.has_parent_path()) {
     std::filesystem::create_directories(index_path.parent_path());
     std::cout << "[FreshBANG::BuildIndex] Ensured directory exists: " << index_path.parent_path()
@@ -418,6 +543,11 @@ bool FreshBANG<T>::SetSearchParams(SearchParams params)
   }
 
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  if (impl->mode() == FreshBANGMode::kBuild) {
+    std::cout << "[FreshBANG::SetSearchParams] Build mode: no-op" << std::endl;
+    return true;
+  }
+
   auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
                                                             impl->algo_name(),
                                                             cuvs::bench::get_dtype_string<T>(),
@@ -532,6 +662,11 @@ void FreshBANG<T>::BatchedSearch(
   }
 
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  if (impl->mode() == FreshBANGMode::kBuild) {
+    std::cout << "[FreshBANG::BatchedSearch] Build mode: no-op" << std::endl;
+    return;
+  }
+
   auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
                                                             impl->algo_name(),
                                                             cuvs::bench::get_dtype_string<T>(),
@@ -552,29 +687,34 @@ void FreshBANG<T>::BatchedSearch(
   const auto elem_count =
     static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(user_build_params_.dataset_dim);
 
-  // Copy host queries to device for cagra::search path.
-  T* device_query_vectors = nullptr;
-  if (cudaMalloc(reinterpret_cast<void**>(&device_query_vectors), elem_count * sizeof(T)) !=
-      cudaSuccess) {
-    std::cerr << "[FreshBANG::BatchedSearch] Error: cudaMalloc failed for query buffer."
-              << std::endl;
-    return;
-  }
-  auto device_query_cleanup =
-    std::unique_ptr<T, void (*)(T*)>(device_query_vectors, [](T* p) {
-      if (p != nullptr) { cudaFree(p); }
-    });
+  // Accept both host and device query pointers.
+  const T* search_queries = query_vectors;
+  std::unique_ptr<T, void (*)(T*)> device_query_cleanup(nullptr, [](T* p) {
+    if (p != nullptr) { cudaFree(p); }
+  });
 
-  if (cudaMemcpy(device_query_vectors,
-                 query_vectors,
-                 elem_count * sizeof(T),
-                 cudaMemcpyHostToDevice) != cudaSuccess) {
-    std::cerr << "[FreshBANG::BatchedSearch] Error: cudaMemcpyHostToDevice failed."
-              << std::endl;
-    return;
-  }
+  bool queries_on_device = cuvs::bench::detail::is_device_pointer(query_vectors);
+  if (!queries_on_device) {
+    T* device_query_vectors = nullptr;
+    if (cudaMalloc(reinterpret_cast<void**>(&device_query_vectors), elem_count * sizeof(T)) !=
+        cudaSuccess) {
+      std::cerr << "[FreshBANG::BatchedSearch] Error: cudaMalloc failed for query buffer."
+                << std::endl;
+      return;
+    }
+    device_query_cleanup.reset(device_query_vectors);
 
-  const T* search_queries = device_query_vectors;
+    if (cudaMemcpy(device_query_vectors,
+                   query_vectors,
+                   elem_count * sizeof(T),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      std::cerr << "[FreshBANG::BatchedSearch] Error: cudaMemcpyHostToDevice failed."
+                << std::endl;
+      return;
+    }
+
+    search_queries = device_query_vectors;
+  }
 
   const std::size_t result_count =
     static_cast<std::size_t>(batch_size) * static_cast<std::size_t>(user_search_params_.recall_at_k);
@@ -614,6 +754,12 @@ bool FreshBANG<T>::SetInsertParams()
   }
 
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  if (impl->mode() == FreshBANGMode::kBuild) {
+    std::cout << "[FreshBANG::SetInsertParams] mode="
+              << cuvs::bench::detail::mode_to_string(impl->mode()) << ": no-op" << std::endl;
+    return true;
+  }
+
   auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
                                                             impl->algo_name(),
                                                             cuvs::bench::get_dtype_string<T>(),
@@ -695,15 +841,37 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
   std::cout << std::endl;
 
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  if (impl->mode() == FreshBANGMode::kBuild) {
+    std::cout << "[FreshBANG::BatchedInsert] mode="
+              << cuvs::bench::detail::mode_to_string(impl->mode()) << ": no-op" << std::endl;
+    return;
+  }
+
   auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
                                                             impl->algo_name(),
                                                             cuvs::bench::get_dtype_string<T>(),
                                                             impl->dim(),
                                                             std::chrono::minutes(60));
   if (!cached.has_value()) {
-    std::cerr << "[FreshBANG::BatchedInsert] Error: algo cache miss for index file "
-              << impl->index_file() << ". Call CreateAlgo() again." << std::endl;
-    return;
+    std::cerr << "[FreshBANG::BatchedInsert] Warning: algo cache miss for index file "
+              << impl->index_file() << ". Attempting in-place recovery via CreateAlgo()."
+              << std::endl;
+    auto recover_mode = impl->mode();
+    auto recover_conf = impl->conf_path();
+    if (!CreateAlgo(recover_conf, recover_mode)) {
+      std::cerr << "[FreshBANG::BatchedInsert] Error: recovery CreateAlgo() failed." << std::endl;
+      return;
+    }
+    impl   = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+    cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
+                                                         impl->algo_name(),
+                                                         cuvs::bench::get_dtype_string<T>(),
+                                                         impl->dim(),
+                                                         std::chrono::minutes(60));
+    if (!cached.has_value()) {
+      std::cerr << "[FreshBANG::BatchedInsert] Error: cache miss persists after recovery." << std::endl;
+      return;
+    }
   }
   auto* algo_obj = static_cast<cuvs::bench::algo<T>*>(cached->algo_ptr);
   if (algo_obj == nullptr) {
@@ -739,16 +907,16 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
           << impl->index_file() << "'. Treating insert as build operation." << std::endl;
 
     algo_obj->set_build_output_file(impl->index_file());
-    std::cout << "[FreshBANG::BatchedInsert] Calling build() with " << batch_size << " vectors"
-              << std::endl;
+    std::cout << "[FreshBANG::BatchedInsert] Calling build() with " << batch_size
+              << " vectors" << std::endl;
     algo_obj->build(insertvectors, batch_size);
     std::cout << "[FreshBANG::BatchedInsert] build() completed" << std::endl;
 
     auto index_path = std::filesystem::path(impl->index_file());
     if (index_path.has_parent_path()) {
       std::filesystem::create_directories(index_path.parent_path());
-      std::cout << "[FreshBANG::BatchedInsert] Ensured directory exists: " << index_path.parent_path()
-                << std::endl;
+      std::cout << "[FreshBANG::BatchedInsert] Ensured directory exists: "
+                << index_path.parent_path() << std::endl;
     }
 #if _KVDEBUG    
     std::cout << "[FreshBANG::BuildIndex] Calling save('" << "/mnt/ssd_volume/cuvs_benchmarks/index/./datasets/sift10k/index/cuvs_cagra.graph_degree32.intermediate_graph_degree32.graph_build_algoNN_DESCENT.before" << "')" << std::endl;
@@ -761,10 +929,9 @@ void FreshBANG<T>::BatchedInsert(const T* insertvectors, uint32_t batch_size, co
 /*        algo_obj->set_search_dataset(insertvectors,
                                  batch_size);
   */
-  }
-  else {
-  impl->set_prefer_insert_dataset_for_search(false);
-  algo_obj->insert(insertvectors, batch_size, ids);
+  } else {
+    impl->set_prefer_insert_dataset_for_search(false);
+    algo_obj->insert(insertvectors, batch_size, ids);
   }
 
   std::cout << "[INSERT] Insert completed successfully" << std::endl;
@@ -796,20 +963,63 @@ void FreshBANG<T>::BatchedDelete(const uint64_t* ids, uint32_t batch_size)
   }
 
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+  if (impl->mode() == FreshBANGMode::kBuild) {
+    std::cout << "[FreshBANG::BatchedDelete] mode="
+              << cuvs::bench::detail::mode_to_string(impl->mode()) << ": no-op" << std::endl;
+    return;
+  }
+
   auto cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
                                                             impl->algo_name(),
                                                             cuvs::bench::get_dtype_string<T>(),
                                                             impl->dim(),
                                                             std::chrono::minutes(60));
   if (!cached.has_value()) {
-    std::cerr << "[FreshBANG::BatchedDelete] Error: algo cache miss for index file "
-              << impl->index_file() << ". Call CreateAlgo() again." << std::endl;
-    return;
+    std::cerr << "[FreshBANG::BatchedDelete] Warning: algo cache miss for index file "
+              << impl->index_file() << ". Attempting in-place recovery via CreateAlgo()."
+              << std::endl;
+    auto recover_mode = impl->mode();
+    auto recover_conf = impl->conf_path();
+    if (!CreateAlgo(recover_conf, recover_mode)) {
+      std::cerr << "[FreshBANG::BatchedDelete] Error: recovery CreateAlgo() failed." << std::endl;
+      return;
+    }
+    impl   = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
+    cached = cuvs::bench::detail::get_cached_algo_entry(impl->index_file(),
+                                                         impl->algo_name(),
+                                                         cuvs::bench::get_dtype_string<T>(),
+                                                         impl->dim(),
+                                                         std::chrono::minutes(60));
+    if (!cached.has_value()) {
+      std::cerr << "[FreshBANG::BatchedDelete] Error: cache miss persists after recovery." << std::endl;
+      return;
+    }
   }
 
   auto* algo_obj = static_cast<cuvs::bench::algo<T>*>(cached->algo_ptr);
   if (algo_obj == nullptr) {
     std::cerr << "[FreshBANG::BatchedDelete] Error: cached algo pointer is null." << std::endl;
+    return;
+  }
+
+  // Mirror insert behavior: if index exists on disk but is not loaded in-process,
+  // load it before mutating ops.
+  bool has_index_on_disk = cuvs::bench::detail::file_exists(impl->index_file());
+  if (has_index_on_disk && !impl->has_live_index()) {
+    try {
+      std::cout << "[FreshBANG::BatchedDelete] Loading existing index from '"
+                << impl->index_file() << "' before delete" << std::endl;
+      algo_obj->load(impl->index_file());
+      std::cout << "[FreshBANG::BatchedDelete] load() completed" << std::endl;
+      impl->set_has_live_index(true);
+    } catch (const std::exception& e) {
+      std::cerr << "[FreshBANG::BatchedDelete] Error: failed to load existing index '"
+                << impl->index_file() << "': " << e.what() << std::endl;
+      return;
+    }
+  } else if (!has_index_on_disk && !impl->has_live_index()) {
+    std::cerr << "[FreshBANG::BatchedDelete] Error: index unavailable at '" << impl->index_file()
+              << "' and no live in-memory index exists for delete." << std::endl;
     return;
   }
 
@@ -824,6 +1034,15 @@ void FreshBANG<T>::Cleanup()
   cuvs::bench::detail::clear_cached_algo_entries();
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
   if (impl == nullptr) {
+    return;
+  }
+
+  if (impl->mode() == FreshBANGMode::kLoad || impl->mode() == FreshBANGMode::kBuild) {
+    std::cout << "[FreshBANG::Cleanup] mode="
+              << cuvs::bench::detail::mode_to_string(impl->mode())
+              << ": keeping index file on disk" << std::endl;
+    delete impl;
+    m_pImpl = nullptr;
     return;
   }
 
@@ -847,11 +1066,16 @@ void FreshBANG<T>::Cleanup()
 template <typename T>
 void FreshBANG<T>::SaveIndex()
 {
-  std::cout << "[FreshBANG::SaveIndex] called" << std::endl;
   auto* impl = static_cast<cuvs::bench::detail::FreshBANGInner<T>*>(m_pImpl);
   if (impl == nullptr) {
     std::cerr << "[FreshBANG::SaveIndex] Error: CreateAlgo() must be called before SaveIndex()."
               << std::endl;
+    return;
+  }
+
+  if (impl->mode() == FreshBANGMode::kLegacy) {
+    std::cout << "[FreshBANG::SaveIndex] mode=" << cuvs::bench::detail::mode_to_string(impl->mode())
+              << " follows legacy behavior: no-op" << std::endl;
     return;
   }
 
@@ -872,10 +1096,19 @@ void FreshBANG<T>::SaveIndex()
     return;
   }
 
-  algo_obj->save(impl->index_file());
-  // print the path where the index is saved for debugging
-  std::cout << "[FreshBANG::SaveIndex] Index saved to: " << impl->index_file() << std::endl;  
+  if (impl->mode() == FreshBANGMode::kBuild) {
+    algo_obj->save(impl->index_file());
+    std::cout << "[FreshBANG::SaveIndex] Build mode: index saved to canonical path: "
+              << impl->index_file() << std::endl;
+  } else {
+    auto temp_path = impl->index_file() + "_temp";
+    algo_obj->save(temp_path);
+    // In load mode, never overwrite the canonical index file.
+    std::cout << "[FreshBANG::SaveIndex] Load mode: index saved to temp path: " << temp_path
+              << std::endl;
+  }
   std::cout << "[FreshBANG::SaveIndex] save() completed" << std::endl;
 }
+  
 
 // freshbang.hpp already has the explicit instantiation; no duplicate needed here.

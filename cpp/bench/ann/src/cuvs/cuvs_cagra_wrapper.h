@@ -78,6 +78,7 @@ void launch_cuvs_bang_delete_kernel(const uint64_t* ids,
                                     const std::shared_ptr<rmm::device_buffer>& d_deleted_rows,
                                     uint32_t* reverse_graph,
                                     int64_t reverse_graph_cols,
+                                    uint32_t* reverse_row_ptr,
                                     uint32_t* reverse_counts);
 
 void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
@@ -86,7 +87,9 @@ void launch_cuvs_bang_build_reverse_graph_kernel(const uint32_t* graph,
                                                  uint32_t* reverse_graph,
                                                  int64_t reverse_graph_cols,
                                                  const uint8_t* deleted_rows,
+                                                 uint32_t* reverse_row_ptr,
                                                  uint32_t* reverse_counts);
+
 }
 
 enum class AllocatorType { kHostPinned, kHostHugePage, kDevice };
@@ -180,7 +183,7 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   void delete_vectors(const uint64_t* ids, size_t num_ids) override;
   void set_insert_param_from_json(const nlohmann::json& conf) override;
 
-  inline bool  has_common_neighbour(
+  inline bool has_common_neighbour(
     IdxT nid,
     IdxT new_row_id,
     const std::vector<IdxT>& graph,
@@ -265,11 +268,12 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
   std::optional<std::string> graph_file_;
   // START: For delete experiments
   std::shared_ptr<rmm::device_buffer> d_deleted_rows_;
+  std::shared_ptr<rmm::device_buffer> d_reverse_row_ptr_;
   std::shared_ptr<rmm::device_buffer> d_reverse_counts_;
   // END: For delete experiments
   // Adding a reverse graph to store the IN neighbors for each node
   std::shared_ptr<raft::device_matrix<IdxT, int64_t, raft::row_major>> reverse_graph_; 
-  double reverse_graph_col_scale_{20};
+  double reverse_graph_col_scale_{1.0}; // scale factor for reverse graph column size relative to forward graph
   int rows_;
    // dataset size supplied at build time
   int build_rows_;
@@ -292,6 +296,16 @@ class cuvs_cagra : public algo<T>, public algo_gpu {
     auto required_bytes = static_cast<size_t>(graph_rows) * sizeof(uint32_t);
     if (!d_reverse_counts_ || d_reverse_counts_->size() < required_bytes) {
       d_reverse_counts_ = std::make_shared<rmm::device_buffer>(
+        required_bytes, handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
+    }
+  }
+
+  inline void ensure_reverse_row_ptr_buffer(int64_t graph_rows)
+  {
+    if (graph_rows <= 0) { return; }
+    auto required_bytes = static_cast<size_t>(graph_rows + 1) * sizeof(uint32_t);
+    if (!d_reverse_row_ptr_ || d_reverse_row_ptr_->size() < required_bytes) {
+      d_reverse_row_ptr_ = std::make_shared<rmm::device_buffer>(
         required_bytes, handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
     }
   }
@@ -595,19 +609,32 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
   refine_ratio_                           = sp.refine_ratio;
   search_params_.deleted_rows_ptr =
     d_deleted_rows_ ? static_cast<const uint8_t*>(d_deleted_rows_->data()) : nullptr;
-    
+
+  // Keep the requested memory preferences even if migration cannot happen yet.
+  auto requested_graph_mem   = sp.graph_mem;
+  auto requested_dataset_mem = sp.dataset_mem;
+
   // Enable cuvs logging for debugging
   //raft::default_logger().set_level( rapids_logger::level_enum::debug);
-  if (sp.graph_mem != graph_mem_) {
+  if (requested_graph_mem != graph_mem_) {
+    auto old_graph = index_ ? index_->graph()
+                            : raft::device_matrix_view<const IdxT, int64_t, raft::row_major>(
+                                nullptr, 0, 0);
+    bool graph_ready = old_graph.data_handle() != nullptr && old_graph.extent(0) > 0 &&
+                       old_graph.extent(1) > 0;
+
+    // Deferred-apply path: remember preference and postpone heavy migration until graph exists.
+    if (!graph_ready) {
+      graph_mem_ = requested_graph_mem;
+      needs_dynamic_batcher_update = true;
+    } else {
     // Move graph to correct memory space
-    graph_mem_ = sp.graph_mem;
+    graph_mem_ = requested_graph_mem;
     RAFT_LOG_DEBUG("moving graph to new memory space: %s", allocator_to_string(graph_mem_).c_str());
     // We create a new graph and copy to it from existing graph
     auto mr = get_mr(graph_mem_);
 
     // Create a new graph, then copy, and __only then__ replace the shared pointer.
-    auto old_graph =
-      index_->graph();  // view of graph_ if it exists, of an internal index member otherwise
     auto new_graph = raft::make_device_mdarray<IdxT, int64_t>(handle_, mr, old_graph.extents());
     raft::copy(new_graph.data_handle(),
                old_graph.data_handle(),
@@ -638,28 +665,40 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
     // NB: update_graph() only stores a view in the index. We need to keep the graph object alive.
     index_->update_graph(handle_, make_const_mdspan(graph_->view()));
     needs_dynamic_batcher_update = true;
+    }
   }
 
-  if (sp.dataset_mem != dataset_mem_ || need_dataset_update_) {
-    dataset_mem_ = sp.dataset_mem;
+  bool dataset_mem_changed = (requested_dataset_mem != dataset_mem_);
+  if (dataset_mem_changed) {
+    dataset_mem_ = requested_dataset_mem;
+    // Force future dataset materialization to use the new memory resource.
+    need_dataset_update_ = true;
+  }
 
-    // First free up existing memory
-    *dataset_ = raft::make_device_matrix<T, int64_t>(handle_, 0, 0);
-    index_->update_dataset(handle_, make_const_mdspan(dataset_->view()));
+  if (need_dataset_update_) {
+    bool dataset_source_ready = input_dataset_v_ && input_dataset_v_->data_handle() != nullptr &&
+                                input_dataset_v_->extent(0) > 0 &&
+                                input_dataset_v_->extent(1) == this->dim_;
 
-    // Allocate space using the correct memory resource.
-    RAFT_LOG_DEBUG("moving dataset to new memory space: %s",
-                   allocator_to_string(dataset_mem_).c_str());
+    if (dataset_source_ready) {
+      // First free up existing memory
+      *dataset_ = raft::make_device_matrix<T, int64_t>(handle_, 0, 0);
+      if (index_) { index_->update_dataset(handle_, make_const_mdspan(dataset_->view())); }
 
-    auto mr = get_mr(dataset_mem_);
-    cuvs::neighbors::cagra::detail::copy_with_padding(handle_, *dataset_, *input_dataset_v_, mr);
+      // Allocate space using the correct memory resource.
+      RAFT_LOG_DEBUG("moving dataset to new memory space: %s",
+                     allocator_to_string(dataset_mem_).c_str());
 
-    auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
-      dataset_->data_handle(), dataset_->extent(0), this->dim_, dataset_->extent(1));
-    index_->update_dataset(handle_, dataset_view);
+      auto mr = get_mr(dataset_mem_);
+      cuvs::neighbors::cagra::detail::copy_with_padding(handle_, *dataset_, *input_dataset_v_, mr);
 
-    need_dataset_update_         = false;
-    needs_dynamic_batcher_update = true;
+      auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
+        dataset_->data_handle(), dataset_->extent(0), this->dim_, dataset_->extent(1));
+      if (index_) { index_->update_dataset(handle_, dataset_view); }
+
+      need_dataset_update_         = false;
+      needs_dynamic_batcher_update = true;
+    }
   }
 
   // dynamic batching
@@ -695,7 +734,9 @@ void cuvs_cagra<T, IdxT>::set_search_param(const search_param_base& param,
 template <typename T, typename IdxT>
 void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
 {
-  
+  // print debug info
+  std::cout << "[cuvs_cagra::set_search_dataset] REAL called with nrow=" << nrow << ", dim=" << dim_ << std::endl;
+  #if 1
   // After an insert, callers may still pass the original base dataset from config.
   // Keep the internally expanded dataset instead if the provided one is smaller.
   if (has_inserted_data_ && index_ && nrow < static_cast<size_t>(index_->graph().extent(0))) {
@@ -708,15 +749,23 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
   }
 
   if (build_rows_ != index_->graph().extent(0)) {
-    // log error
-    std::cerr << "Warning: set_search_dataset called with build_rows_=" << build_rows_
-              << " which does not match the number of rows used during build time="
-              << index_->graph().extent(0) << ". This may lead to unexpected behavior." << std::endl;
-              return;
+    // log error and bail out to keep build-time row metadata consistent.
+    std::cerr << "Error: set_search_dataset called with build_rows_=" << build_rows_
+              << " which does not match current graph rows=" << index_->graph().extent(0)
+              << ". Aborting set_search_dataset." << std::endl;
+    return;
   } 
-
-
   auto stream              = raft::resource::get_cuda_stream(handle_);
+  auto log_device_mem_diag = [&](const char* phase) {
+    raft::resource::sync_stream(handle_);
+    size_t free_bytes  = 0;
+    size_t total_bytes = 0;
+    RAFT_CUDA_TRY(cudaMemGetInfo(&free_bytes, &total_bytes));
+    auto used_bytes = total_bytes - free_bytes;
+    std::cout << "[set_search_dataset] memory " << phase << ": used=" << used_bytes
+              << " free=" << free_bytes << " total=" << total_bytes << " bytes"
+              << std::endl;
+  };
   const auto expected_rows = rows_ > 0 ? static_cast<size_t>(build_rows_) : size_t{0};
   // I want dataset to be atleast the size of the build index
   if (expected_rows != 0 && nrow < expected_rows) { // relaxed the check when running as EXE (CUVS_CAGRA_ANN_BENCH , legacy flow rows_ = 0)
@@ -726,11 +775,21 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
       ") does not match initial dataset row count used during algo creation (" +
       std::to_string(expected_rows) + ").");
   }
-  auto old_graph   = index_->graph();
-  auto old_rows    = old_graph.extent(0);
-  auto cols        = old_graph.extent(1);
-  // Max rows that should be supported 
+  auto old_graph = index_->graph();
+  auto old_rows  = old_graph.extent(0);
+  auto cols      = old_graph.extent(1);
+
+  // Always expand/capacity-align search-time graph and dataset to rows_.
   auto target_rows = static_cast<int64_t>(rows_);
+  if (target_rows < old_rows) { target_rows = old_rows; }
+
+  std::cout << "[set_search_dataset] planning: input_rows=" << nrow
+            << " old_graph_rows=" << old_rows
+            << " old_graph_cols=" << cols
+            << " rows_=" << rows_
+            << " build_rows_=" << build_rows_
+            << " target_rows=" << target_rows
+            << " has_inserted_data_=" << has_inserted_data_ << std::endl;
 
   // Keep any host-side expansion buffer alive for the full function scope.
   std::vector<T> expanded_dataset;
@@ -749,6 +808,8 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
   
   // if target_rows > nrow, expand the input argument dataset by copying to expanded memory zero-padding on the host memory
   if (target_rows > static_cast<int64_t>(active_nrow)) {
+    std::cout << "[set_search_dataset] dataset expansion (host padding): from " << active_nrow
+              << " rows to " << target_rows << " rows" << std::endl;
     // allocate new host memory and copy existing dataset
     expanded_dataset.resize(static_cast<size_t>(target_rows * dim_), T{0});
     for (size_t i = 0; i < active_nrow; ++i) {
@@ -763,7 +824,6 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
 
   if (index_params_.num_dataset_splits > 1 &&
       index_params_.merge_type == CagraMergeType::kLogical) {
-    bool dataset_is_on_host = raft::get_device_for_address(active_dataset) == -1;
     IdxT rows_per_split =
       raft::ceildiv<IdxT>(active_nrow, static_cast<IdxT>(index_params_.num_dataset_splits));
     for (size_t i = 0; i < sub_indices_.size(); ++i) {
@@ -773,15 +833,9 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
       const T* sub_ptr = active_dataset + static_cast<size_t>(start) * dim_;
       auto sub_host =
         raft::make_host_matrix_view<const T, int64_t, raft::row_major>(sub_ptr, rows, dim_);
-      auto sub_dev =
-        raft::make_device_matrix_view<const T, int64_t, raft::row_major>(sub_ptr, rows, dim_);
       auto sub_index = sub_indices_[i].get();
       if (index_params_.merge_type == CagraMergeType::kLogical) {
-        if (dataset_is_on_host) {
-          sub_index->update_dataset(handle_, sub_host);
-        } else {
-          sub_index->update_dataset(handle_, sub_dev);
-        }
+        sub_index->update_dataset(handle_, sub_host);
       }
     }
     need_dataset_update_ = false;
@@ -792,63 +846,71 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
       dynamic_cast<const cuvs::neighbors::vpq_dataset<float, ds_idx_type>*>(&index_->data());
     // It can happen that we are re-using a previous algo object which already has
     // the dataset set. Check if we need update.
+#if 1
+    auto index_dataset = index_->dataset();
+    bool can_reuse_index_dataset =
+      !need_dataset_update_ && !has_inserted_data_ && index_dataset.data_handle() != nullptr &&
+      index_dataset.extent(1) == this->dim_ &&
+      static_cast<size_t>(index_dataset.extent(0)) == active_nrow;
 
-    if (static_cast<size_t>(input_dataset_v_->extent(0)) != active_nrow ||
-        input_dataset_v_->data_handle() != active_dataset) {
-      bool dataset_is_on_host = raft::get_device_for_address(active_dataset) == -1;
-      if (dataset_is_on_host) {
-        auto host_dataset_view =
-          raft::make_host_matrix_view<const T, int64_t, raft::row_major>(active_dataset, active_nrow, this->dim_);
-        auto dataset_mr = get_mr(dataset_mem_);
-        cuvs::neighbors::cagra::detail::copy_with_padding(
-          handle_, *dataset_, host_dataset_view, dataset_mr);
-        auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
-          dataset_->data_handle(), this->rows_, this->dim_, dataset_->extent(1));
-        index_->update_dataset(handle_, dataset_view);
+    if (can_reuse_index_dataset) {
+      // Keep search setup lightweight: reuse dataset already attached at build/load.
+      *input_dataset_v_ = raft::make_device_matrix_view<const T, int64_t>(
+        index_dataset.data_handle(), index_dataset.extent(0), this->dim_);
+      need_dataset_update_ = false;
+    } else if (static_cast<size_t>(input_dataset_v_->extent(0)) != active_nrow ||
+               input_dataset_v_->data_handle() != active_dataset) {
+      auto materialized_rows = static_cast<int64_t>(active_nrow);
+      std::cout << "[set_search_dataset] dataset expansion (device copy_with_padding): source_rows="
+                << active_nrow << " target_rows=" << materialized_rows << " dim=" << this->dim_
+                << std::endl;
+      auto expected_dataset_bytes =
+        static_cast<size_t>(materialized_rows) * static_cast<size_t>(this->dim_) * sizeof(T);
+      std::cout << "[set_search_dataset] expected dataset_ allocation bytes="
+                << expected_dataset_bytes << " (rows=" << materialized_rows
+                << ", cols=" << this->dim_ << ", sizeof(T)=" << sizeof(T) << ")"
+                << std::endl;
+      log_device_mem_diag("before dataset expansion");
+      auto host_dataset_view =
+        raft::make_host_matrix_view<const T, int64_t, raft::row_major>(active_dataset, active_nrow, this->dim_);
+      auto dataset_mr = get_mr(dataset_mem_);
+      cuvs::neighbors::cagra::detail::copy_with_padding(
+        handle_, *dataset_, host_dataset_view, dataset_mr);
+      auto dataset_view = raft::make_device_strided_matrix_view<const T, int64_t>(
+        dataset_->data_handle(), materialized_rows, this->dim_, dataset_->extent(1));
+      index_->update_dataset(handle_, dataset_view);
 
-        *input_dataset_v_ =
-          raft::make_device_matrix_view<const T, int64_t>(dataset_->data_handle(), this->rows_, this->dim_);
- 
-        need_dataset_update_ = false;
-      } else {
-        // Question: should dataset_ and index_->update_dataset() also be updated in this case? 
-        *input_dataset_v_ =
-          raft::make_device_matrix_view<const T, int64_t>(active_dataset, active_nrow, this->dim_);
-        need_dataset_update_ = !is_vpq;  // ignore update if this is a VPQ dataset.
-        // log an error and return
-        std::cerr << "Warning: set_search_dataset called with a device pointer. "
-                  << std::endl;
-        return;
-      }
+      std::cout << "[set_search_dataset] dataset update complete: index_dataset_rows="
+                << index_->dataset().extent(0)
+                << " index_dataset_cols=" << index_->dataset().extent(1) << std::endl;
+      log_device_mem_diag("after dataset expansion");
+
+      *input_dataset_v_ =
+        raft::make_device_matrix_view<const T, int64_t>(
+          dataset_->data_handle(), materialized_rows, this->dim_);
+
+      need_dataset_update_ = false;
     }
+    #endif
   }
 
-  // If we are attaching to a bigger dataset than the current graph size,
-  // expand graph_ by replicating the last valid row.
-#ifdef _KVDEBUG
-  std::cout << "[cuvs_cagra::set_search_dataset] expanding old graph, old_rows=" << old_rows
-            << ", target_rows=" << target_rows << std::endl;
-#endif
+
   if (old_rows < target_rows) {
     auto mr                 = get_mr(graph_mem_);
-    auto stream             = raft::resource::get_cuda_stream(handle_);
-    auto reverse_cols       = get_reverse_graph_cols(cols);
+    log_device_mem_diag("before forward graph expansion");
+    std::cout << "[set_search_dataset] graph expansion: old_rows=" << old_rows
+              << " target_rows=" << target_rows << " cols=" << cols << std::endl;
+    auto expected_new_graph_bytes =
+      static_cast<size_t>(target_rows) * static_cast<size_t>(cols) * sizeof(IdxT);
+    std::cout << "[set_search_dataset] expected new_expanded_graph allocation bytes="
+              << expected_new_graph_bytes << " (rows=" << target_rows << ", cols=" << cols
+              << ", sizeof(IdxT)=" << sizeof(IdxT) << ")" << std::endl;
     auto new_expanded_graph = raft::make_device_mdarray<IdxT, int64_t>(
       handle_, mr, raft::make_extents<int64_t>(target_rows, cols));
-    auto new_expanded_reverse_graph = raft::make_device_mdarray<IdxT, int64_t>(
-      handle_, mr, raft::make_extents<int64_t>(target_rows, reverse_cols));
 
     if (old_rows > 0) {
       raft::copy(
         new_expanded_graph.data_handle(), old_graph.data_handle(), old_graph.size(), stream);
-
-      if (reverse_graph_ && reverse_graph_->extent(0) == old_rows &&
-          reverse_graph_->extent(1) == reverse_cols) {
-        raft::copy(new_expanded_reverse_graph.data_handle(),
-                   reverse_graph_->data_handle(),
-                   reverse_graph_->size(),
-                   stream);
-      }
     }
 
     // Zero-initialize the tail rows [old_rows, target_rows).
@@ -857,22 +919,11 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
     // computes distances against invalid dataset addresses → OOB illegal access.
     auto tail_offset = static_cast<size_t>(old_rows) * static_cast<size_t>(cols);
     auto tail_elems  = static_cast<size_t>(target_rows - old_rows) * static_cast<size_t>(cols);
-    auto reverse_tail_offset = static_cast<size_t>(old_rows) * static_cast<size_t>(reverse_cols);
-    auto reverse_tail_elems  = static_cast<size_t>(target_rows - old_rows) *
-                              static_cast<size_t>(reverse_cols);
     if (tail_elems > 0) {
       RAFT_CUDA_TRY(cudaMemsetAsync(
         new_expanded_graph.data_handle() + tail_offset,
         0,
         tail_elems * sizeof(IdxT),
-        stream));
-    }
-
-    if (reverse_tail_elems > 0) {
-      RAFT_CUDA_TRY(cudaMemsetAsync(
-        new_expanded_reverse_graph.data_handle() + reverse_tail_offset,
-        0,
-        reverse_tail_elems * sizeof(IdxT),
         stream));
     }
     raft::resource::sync_stream(handle_);
@@ -882,8 +933,11 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
               << " zeroed_tail_elems=" << tail_elems << std::endl;
 
     *graph_ = std::move(new_expanded_graph);
-    *reverse_graph_ = std::move(new_expanded_reverse_graph);
     index_->update_graph(handle_, make_const_mdspan(graph_->view()));
+    log_device_mem_diag("after forward graph expansion");
+
+    std::cout << "[set_search_dataset] forward graph committed; reverse graph will be rebuilt"
+              << " after the committed graph is visible." << std::endl;
 
   #if 0
     // Also expand deleted_rows buffer and mark expanded rows as deleted
@@ -949,11 +1003,25 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
     auto reverse_cols = get_reverse_graph_cols(curr_cols);
     if (!reverse_graph_ || reverse_graph_->extent(0) != curr_rows ||
         reverse_graph_->extent(1) != reverse_cols) {
+      log_device_mem_diag("before reverse graph expansion");
+      auto old_reverse_rows = reverse_graph_ ? reverse_graph_->extent(0) : int64_t{0};
+      auto old_reverse_cols = reverse_graph_ ? reverse_graph_->extent(1) : int64_t{0};
+      std::cout << "[set_search_dataset] reverse graph expansion (shape fixup): old_rows="
+                << old_reverse_rows << " old_cols=" << old_reverse_cols
+                << " new_rows=" << curr_rows << " new_cols=" << reverse_cols << std::endl;
+      auto expected_reverse_graph_bytes =
+        static_cast<size_t>(curr_rows) * static_cast<size_t>(reverse_cols) * sizeof(IdxT);
+      std::cout << "[set_search_dataset] expected reverse_graph_ allocation bytes="
+                << expected_reverse_graph_bytes << " (rows=" << curr_rows
+                << ", cols=" << reverse_cols << ", sizeof(IdxT)=" << sizeof(IdxT) << ")"
+                << std::endl;
       *reverse_graph_ = raft::make_device_mdarray<IdxT, int64_t>(
         handle_, get_mr(graph_mem_), raft::make_extents<int64_t>(curr_rows, reverse_cols));
+      log_device_mem_diag("after reverse graph expansion");
     }
 
     ensure_reverse_counts_buffer(curr_rows);
+    ensure_reverse_row_ptr_buffer(curr_rows);
     detail::launch_cuvs_bang_build_reverse_graph_kernel(
       reinterpret_cast<const uint32_t*>(curr_graph.data_handle()),
       curr_rows,
@@ -961,6 +1029,7 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
       reinterpret_cast<uint32_t*>(reverse_graph_->data_handle()),
       reverse_cols,
       d_deleted_rows_ ? static_cast<const uint8_t*>(d_deleted_rows_->data()) : nullptr,
+      d_reverse_row_ptr_ ? static_cast<uint32_t*>(d_reverse_row_ptr_->data()) : nullptr,
       static_cast<uint32_t*>(d_reverse_counts_->data()));
 
     // Persist reverse graph after rebuild.
@@ -987,6 +1056,23 @@ void cuvs_cagra<T, IdxT>::set_search_dataset(const T* dataset, size_t nrow)
     }
 #endif
   }
+
+  // Final consistency check after dataset/graph updates and reverse-graph rebuild.
+  {
+    auto final_graph = index_->graph();
+    auto final_data  = index_->dataset();
+    auto final_graph_rows = final_graph.extent(0);
+    auto final_data_rows  = final_data.extent(0);
+    if (final_graph_rows != final_data_rows) {
+      std::cerr << "[set_search_dataset] Error: graph/dataset row mismatch after setup. "
+                << "graph_rows=" << final_graph_rows
+                << " dataset_rows=" << final_data_rows << std::endl;
+      throw std::runtime_error("set_search_dataset: graph and dataset row counts must match.");
+    }
+    std::cout << "[set_search_dataset] final consistency check passed: graph_rows="
+              << final_graph_rows << " dataset_rows=" << final_data_rows << std::endl;
+  }
+  #endif
 }
 
 template <typename T, typename IdxT>
@@ -1038,7 +1124,8 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
     index_ = std::make_shared<cuvs::neighbors::cagra::index<T, IdxT>>(handle_);
     cuvs::neighbors::cagra::deserialize(handle_, file, index_.get());
   }
-  // expecting only legacy constructor to call load
+  // No longer expecting only legacy constructor to call load
+  #if 0
   if (rows_ != 0)
   {
     // throw exception
@@ -1046,21 +1133,34 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
       "load: algo was created with non-zero rows (" + std::to_string(rows_) +
       ") but loaded index has " + std::to_string(index_->graph().extent(0)) + " rows.");   
   }
-  rows_ = index_->graph().extent(0);
-  build_rows_ = rows_;
+  #endif
+
+  auto loaded_rows = static_cast<int>(index_->graph().extent(0));
+  if (rows_ == 0) { rows_ = loaded_rows; }
+  auto buffer_rows = std::max(rows_, loaded_rows);
+  // log details of on the loaded index
+  std::cout << "[cuvs_cagra::load] loaded index from " << file
+            << " with loaded_rows=" << loaded_rows
+            << " target_rows=" << rows_
+            << " buffer_rows=" << buffer_rows
+            << ", cols=" << index_->graph().extent(1)
+            << ", dataset rows=" << index_->dataset().extent(0)
+            << ", dataset cols=" << index_->dataset().extent(1) << std::endl;
+
+  build_rows_ = loaded_rows;
   d_deleted_rows_         = std::make_shared<rmm::device_buffer>(
-    static_cast<size_t>(rows_) * sizeof(uint8_t), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
+    static_cast<size_t>(buffer_rows) * sizeof(uint8_t), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
   d_dist_threshold1_ = std::make_shared<rmm::device_buffer>(
-    static_cast<size_t>(rows_) * sizeof(float), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
+    static_cast<size_t>(buffer_rows) * sizeof(float), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
   d_dist_threshold2_ = std::make_shared<rmm::device_buffer>(
-    static_cast<size_t>(rows_) * sizeof(float), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
+    static_cast<size_t>(buffer_rows) * sizeof(float), handle_.get_sync_stream(), get_mr(AllocatorType::kDevice));
   
   // log the value of delete_rows_init_size for debugging
   RAFT_CUDA_TRY(cudaMemsetAsync(
-    d_deleted_rows_->data(), 1, rows_ * sizeof(uint8_t), handle_.get_sync_stream()));
+    d_deleted_rows_->data(), 1, static_cast<size_t>(buffer_rows) * sizeof(uint8_t), handle_.get_sync_stream()));
     raft::resource::sync_stream(handle_);
   
-  auto delete_rows_init_size = static_cast<size_t>(rows_); // default
+  auto delete_rows_init_size = static_cast<size_t>(build_rows_); // default
   if (const char* env_val = std::getenv("CUVS_BENCH_VALID_ROWS_INIT_SIZE")) {
     try {
       delete_rows_init_size = std::stoull(env_val);
@@ -1070,9 +1170,10 @@ void cuvs_cagra<T, IdxT>::load(const std::string& file)
     }
   }
 
+  std::cout << "[cuvs_cagra::load] Initializing deleted rows buffer with size: " << delete_rows_init_size << std::endl;
   // log the value of delete_rows_init_size for debugging
 #ifdef _KVDEBUG
-  std::cout << "[cuvs_cagra] Initializing deleted rows buffer with size: " << delete_rows_init_size << std::endl;
+  std::cout << "[cuvs_cagra::load] Initializing deleted rows buffer with size: " << delete_rows_init_size << std::endl;
 #endif
   RAFT_CUDA_TRY(cudaMemsetAsync(
     d_deleted_rows_->data(), 0, delete_rows_init_size * sizeof(uint8_t), handle_.get_sync_stream()));
@@ -1765,12 +1866,14 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
   auto* graph_ptr = reinterpret_cast<const uint32_t*>(graph_view.data_handle());
   auto graph_rows = graph_view.extent(0);
   auto graph_cols = graph_view.extent(1);
+  ensure_reverse_counts_buffer(graph_rows);
+  ensure_reverse_row_ptr_buffer(graph_rows);
   auto* cached_graph_ptr = graph_ ? reinterpret_cast<const void*>(graph_->data_handle()) : nullptr;
   auto cached_graph_rows = graph_ ? graph_->extent(0) : int64_t{0};
   auto cached_graph_cols = graph_ ? graph_->extent(1) : int64_t{0};
   // get handle to dataset pointer
   auto* dataset_ptr = reinterpret_cast<T*>(dataset_->data_handle());
-
+#if 1
   std::printf(
     "[insert_vectors] num_ids=%zu idx_graph_ptr=%p idx_rows=%lld idx_cols=%lld cached_graph_ptr=%p "
     "cached_rows=%lld cached_cols=%lld dataset_ptr=%p\n",
@@ -1791,7 +1894,7 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
                                          d_deleted_rows_,
                                          d_dist_threshold1_,
                                          d_dist_threshold2_,
-                                         vectors,
+                                         queries,
                                          dataset_ptr,
                                          dim_,
                                         neighbors,
@@ -1800,8 +1903,8 @@ void cuvs_cagra<T, IdxT>::insert(const T* vectors, size_t num_vectors, const uin
                                         reverse_graph_ ? reinterpret_cast<uint32_t*>(reverse_graph_->data_handle()) : nullptr,
                                         reverse_graph_ ? reverse_graph_->extent(1) : int64_t{0},
                                         d_reverse_counts_ ? static_cast<uint32_t*>(d_reverse_counts_->data()) : nullptr);
-
-  std::cout << "[insert] complete: old_rows=" 
+#endif
+  std::cout << "[insert] completed: old_rows=" 
             /*<< old_rows
             << " inserted=" << batch_size
             << " new_rows=" << new_rows
@@ -1892,6 +1995,7 @@ void cuvs_cagra<T, IdxT>::delete_vectors(const uint64_t* ids, size_t num_ids)
       d_deleted_rows_,
       reverse_graph_ ? reinterpret_cast<uint32_t*>(reverse_graph_->data_handle()) : nullptr,
       reverse_graph_ ? reverse_graph_->extent(1) : int64_t{0},
+      d_reverse_row_ptr_ ? static_cast<uint32_t*>(d_reverse_row_ptr_->data()) : nullptr,
       d_reverse_counts_ ? static_cast<uint32_t*>(d_reverse_counts_->data()) : nullptr
       #if 0
       ,
